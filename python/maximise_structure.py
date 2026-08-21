@@ -92,6 +92,8 @@ def _main():
     np.savetxt(f"{args.label}_Uncertainties.dat", uncertainty)
     np.savetxt(f"{args.label}_Relative_Uncertainties.dat", relative_uncertainty)
 
+    plot_DCT_spectrum(CI_data, args, kc)
+
     if args.save_all:
 
         DM_file = open(f"DM.txt", "w")
@@ -109,7 +111,6 @@ def _main():
         plot_smooth_I_DM_t(I_smooth, DM_data, args)
         plot_detrended_noise(delta_I, DM_data, args)
         plot_relative_detrended_noise(delta_delta_I, DM_data, args)
-        plot_DCT_spectrum(CI_data, args, kc)
 
         # Uncertainty-time plots
         plot_uncertainty(uncertainty, DM_data, args)

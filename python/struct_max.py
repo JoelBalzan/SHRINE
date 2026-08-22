@@ -23,6 +23,27 @@ from scipy.fftpack import dct
 from struct_max_core import (dm_range_from_relative_uncertainty, get_kc,
                              recovered_dm, structure_param)
 
+try:
+    from numba import njit
+    _NUMBA_AVAILABLE = True
+except Exception:
+    njit = None
+    _NUMBA_AVAILABLE = False
+
+if _NUMBA_AVAILABLE:
+
+    @njit(cache=True)
+    def _apply_shifts_numba(data, delay_samples, fill, origin):
+        n_time_out = fill.shape[1]
+        out = fill.copy()
+        for i in range(data.shape[0]):
+            shift = delay_samples[i]
+            for t in range(data.shape[1]):
+                t_out = t + shift - origin
+                if 0 <= t_out < n_time_out:
+                    out[i, t_out] = data[i, t]
+        return out
+
 # ──────────────────────────────────────────────────────────────────────
 # Stokes I/O  (inlined from frbop/utils/stokes_io.py to stay standalone)
 # ──────────────────────────────────────────────────────────────────────
@@ -297,12 +318,18 @@ class _Dedisperser:
         else:
             raise ValueError(f"Unknown dedispersion mode '{mode}'")
 
-        for i in range(data.shape[0]):
-            shift = int(delay_samples[i])
-            for t in range(data.shape[1]):
-                t_out = t + shift - origin
-                if 0 <= t_out < out.shape[1]:
-                    out[i, t_out] = data[i, t]
+        # Scatter each channel's samples into place (identical result to
+        # frbop's per-sample loop; numba-accelerated when available)
+        if _NUMBA_AVAILABLE:
+            out = _apply_shifts_numba(data, delay_samples, out, origin)
+        else:
+            n_time = data.shape[1]
+            for i in range(data.shape[0]):
+                so = int(delay_samples[i]) - origin
+                t0 = max(0, -so)
+                t1 = min(n_time, n_time_out - so)
+                if t1 > t0:
+                    out[i, t0 + so : t1 + so] = data[i, t0:t1]
         return out
 
 

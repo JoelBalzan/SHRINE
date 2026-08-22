@@ -2,7 +2,7 @@
 """Filter design & order sweep test suite for SHRINE structure maximisation.
 
 Sweeps Butterworth order (O) and spectral cutoff (kc) over a 2-D grid,
-measuring bias, scatter, formal uncertainty, and coverage across noise
+measuring bias, scatter, DM range half-width, and coverage across noise
 realisations (synthetic mode) or on a single real dataset (real mode).
 
 In both modes the data is handled identically to a real observation:
@@ -446,7 +446,7 @@ def _eval_one(i_dm_t, dm_values, order, kc, CI_data=None):
     unc_minus = 0.0 if low_dm is None else dm_best - low_dm
     unc_plus = 0.0 if high_dm is None else high_dm - dm_best
     formal_unc = 0.5 * (unc_minus + unc_plus)
-    return dm_best, formal_unc
+    return dm_best, formal_unc, unc_minus, unc_plus
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -514,12 +514,14 @@ def run_synthetic_sweep(args, output_dir: Path):
         for order in orders:
             for kc in kc_values:
                 try:
-                    dm_best, formal_unc = _eval_one(i_dm_t, dm_values, order, kc,
-                                                    CI_data=CI_data)
+                    dm_best, formal_unc, unc_minus, unc_plus = _eval_one(
+                        i_dm_t, dm_values, order, kc, CI_data=CI_data)
                 except Exception:
                     continue
                 collect[(order, kc)]["dms"].append(dm_best)
                 collect[(order, kc)]["uncs"].append(formal_unc)
+                collect[(order, kc)]["uncs_minus"].append(unc_minus)
+                collect[(order, kc)]["uncs_plus"].append(unc_plus)
 
     plot_dct_spectrum(first_CI, output_dir, args.ext, tag="synthetic")
 
@@ -541,6 +543,8 @@ def run_synthetic_sweep(args, output_dir: Path):
             bias = float(np.mean(dms - args.injected_dm))
             scatter = float(np.std(dms))
             mean_unc = float(np.mean(uncs))
+            mean_unc_minus = float(np.mean(collect[(order, kc)]["uncs_minus"]))
+            mean_unc_plus = float(np.mean(collect[(order, kc)]["uncs_plus"]))
             within = np.abs(dms - args.injected_dm) <= uncs
             coverage = float(np.mean(within))
 
@@ -550,6 +554,8 @@ def run_synthetic_sweep(args, output_dir: Path):
                 "bias": bias,
                 "scatter": scatter,
                 "mean_formal_unc": mean_unc,
+                "mean_unc_minus": mean_unc_minus,
+                "mean_unc_plus": mean_unc_plus,
                 "coverage": coverage,
                 "n_realisations": len(dms),
                 "mean_recovered_dm": float(np.mean(dms)),
@@ -653,8 +659,8 @@ def run_real_sweep(args, output_dir: Path):
                 done += 1
                 t0 = _time.time()
                 try:
-                    dm_best, formal_unc = _eval_one(i_dm_t, dm_values, order, kc,
-                                                    CI_data=CI_data)
+                    dm_best, formal_unc, unc_minus, unc_plus = _eval_one(
+                        i_dm_t, dm_values, order, kc, CI_data=CI_data)
                 except Exception as e:
                     sys.stderr.write(f"\r  [{done}/{total}] O={order:2d} kc={kc:3d}  FAILED: {e}   \n")
                     sys.stderr.flush()
@@ -666,6 +672,8 @@ def run_real_sweep(args, output_dir: Path):
                     "kc": kc,
                     "recovered_dm": dm_best,
                     "formal_unc": formal_unc,
+                    "unc_minus": unc_minus,
+                    "unc_plus": unc_plus,
                 }
                 if args.true_dm is not None:
                     row["bias"] = dm_best - args.true_dm
@@ -675,7 +683,8 @@ def run_real_sweep(args, output_dir: Path):
                 all_rows.append(row)
                 bias_str = f"  bias={row['bias']:+.6f}" if "bias" in row else ""
                 sys.stderr.write(f"\r  [{done}/{total}] O={order:2d} kc={kc:3d}  "
-                                 f"DM={dm_best:.6f}  unc={formal_unc:.6f}"
+                                 f"DM={dm_best:.6f}  "
+                                 f"unc=-{unc_minus:.4g}/+{unc_plus:.4g}"
                                  f"{bias_str}  ")
                 sys.stderr.flush()
 
@@ -684,7 +693,8 @@ def run_real_sweep(args, output_dir: Path):
         print(f"  Running default SHRINE (O=3, auto-kc) for reference...")
         try:
             auto_kc = int(get_kc(CI_data))
-            dm_ref, unc_ref = _eval_one(i_dm_t, dm_values, 3, auto_kc, CI_data=CI_data)
+            dm_ref, unc_ref, _, _ = _eval_one(i_dm_t, dm_values, 3, auto_kc,
+                                              CI_data=CI_data)
             ref_kc = auto_kc
             print(f"  Default SHRINE: DM={dm_ref:.6f}  unc={unc_ref:.6f}  "
                   f"auto-kc={ref_kc}")
@@ -806,23 +816,23 @@ def plot_sweep_heatmaps(rows, output_dir: Path, ext: str, mode: str, input_dm=0.
         if has_bias:
             vabs = max(np.nanpercentile(np.abs(bias_grid[np.isfinite(bias_grid)]), 95), 1e-6)
             _imshow(axes[0], bias_grid, "RdBu_r",
-                    r"$\langle DM_{\rm rec} - DM_{\rm true}\rangle$ [pc cm$^{-3}$]",
+                    r"$\langle DM - DM_{\rm true}\rangle$ [pc cm$^{-3}$]",
                     "Bias", vmin=-vabs, vmax=vabs)
         else:
             axes[0].set_title("Bias (no data)")
 
         _imshow(axes[1], scatter_grid, "viridis",
-                r"Scatter $\sigma(DM_{\rm rec})$ [pc cm$^{-3}$]",
+                r"Scatter $\sigma(DM)$ [pc cm$^{-3}$]",
                 "Scatter (std of recovered DM)")
 
         _imshow(axes[2], unc_grid, "viridis",
-                r"Mean formal $\sigma$ [pc cm$^{-3}$]",
-                "Mean formal uncertainty")
+                r"Mean $(\Delta_{\rm DM}^{+}{+}|\Delta_{\rm DM}^{-}|)/2$ [pc cm$^{-3}$]",
+                "Mean DM range half-width")
 
         if has_coverage:
             _imshow(axes[3], coverage_grid, "RdYlGn",
                     "Coverage fraction",
-                    r"Coverage (within formal $\sigma$)", vmin=0, vmax=1)
+                    r"Coverage (within range half-width)", vmin=0, vmax=1)
         else:
             axes[3].set_title("Coverage (no data)")
 
@@ -832,7 +842,7 @@ def plot_sweep_heatmaps(rows, output_dir: Path, ext: str, mode: str, input_dm=0.
         plt.close()
         print(f"Saved {output_dir / f'sweep_heatmaps.{ext}'}")
 
-        # Scatter vs formal uncertainty
+        # Scatter vs range half-width
         if has_scatter and np.any(np.isfinite(unc_grid)):
             fig, axes2 = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -844,9 +854,9 @@ def plot_sweep_heatmaps(rows, output_dir: Path, ext: str, mode: str, input_dm=0.
                     ax.plot(u[v], s[v], "o-", label=f"O={order}", markersize=3)
             lims = [0, max(ax.get_xlim()[1], ax.get_ylim()[1]) * 1.05]
             ax.plot(lims, lims, "--", color="k", alpha=0.5)
-            ax.set_xlabel(r"Mean formal $\sigma$")
-            ax.set_ylabel(r"Scatter $\sigma(DM_{\rm rec})$")
-            ax.set_title("Scatter vs formal uncertainty\n(diagonal = ideal)")
+            ax.set_xlabel(r"Mean $(\Delta^{+}{+}|\Delta^{-}|)/2$ [pc cm$^{-3}$]")
+            ax.set_ylabel(r"Scatter $\sigma(DM)$")
+            ax.set_title("Scatter vs range half-width\n(diagonal = ideal)")
             ax.legend(fontsize=7, ncol=2)
             ax.grid(True, alpha=0.3)
 
@@ -857,9 +867,9 @@ def plot_sweep_heatmaps(rows, output_dir: Path, ext: str, mode: str, input_dm=0.
                 if np.any(v):
                     ax.plot(u[v], s[v], "o-", label=f"kc={kc}", markersize=3)
             ax.plot(lims, lims, "--", color="k", alpha=0.5)
-            ax.set_xlabel(r"Mean formal $\sigma$")
-            ax.set_ylabel(r"Scatter $\sigma(DM_{\rm rec})$")
-            ax.set_title("Scatter vs formal uncertainty\n(coloured by kc)")
+            ax.set_xlabel(r"Mean $(\Delta^{+}{+}|\Delta^{-}|)/2$ [pc cm$^{-3}$]")
+            ax.set_ylabel(r"Scatter $\sigma(DM)$")
+            ax.set_title("Scatter vs range half-width\n(coloured by kc)")
             ax.legend(fontsize=7, ncol=2)
             ax.grid(True, alpha=0.3)
 
@@ -904,59 +914,126 @@ def plot_sweep_heatmaps(rows, output_dir: Path, ext: str, mode: str, input_dm=0.
                 "ref": ref, "label": plabel,
             })
 
-        # Shared colour limits across all peaks
-        all_dm_finite = np.concatenate([d["dm_grid"][np.isfinite(d["dm_grid"])]
-                                        for d in peak_data if d is not None])
-        all_unc_finite = np.concatenate([d["unc_grid"][np.isfinite(d["unc_grid"])]
-                                         for d in peak_data if d is not None])
+        # Shared colour limits centred on the input DM: white always marks
+        # exact recovery, and identical saturation across components keeps
+        # colours directly comparable
         dm_centre = input_dm
-        dm_half = max(abs(np.min(all_dm_finite) - dm_centre),
-                      abs(np.max(all_dm_finite) - dm_centre)) * 1.05 if len(all_dm_finite) else 1.0
-        unc_vmax = np.max(all_unc_finite) * 1.05 if len(all_unc_finite) else 1.0
+        halves = [float(np.max(np.abs(d["dm_grid"][np.isfinite(d["dm_grid"])] - dm_centre)))
+                  for d in peak_data
+                  if d is not None and np.any(np.isfinite(d["dm_grid"]))]
+        dm_half = max(halves) * 1.05 if halves else 1.0
+        if not dm_half > 0:
+            dm_half = 1.0
+        dm_vmin, dm_vmax = dm_centre - dm_half, dm_centre + dm_half
 
-        fig, axes = plt.subplots(n_peaks, 2, figsize=(14, 5 * n_peaks),
-                                 squeeze=False)
+        pulls = []
+        for d in peak_data:
+            if d is None:
+                continue
+            with np.errstate(divide="ignore", invalid="ignore"):
+                d["pull_grid"] = (d["dm_grid"] - dm_centre) / d["unc_grid"]
+            pfin = d["pull_grid"][np.isfinite(d["pull_grid"])]
+            if pfin.size:
+                pulls.append(pfin)
+            ufin = d["unc_grid"][np.isfinite(d["unc_grid"])]
+            uvmax = float(np.max(ufin)) * 1.05 if ufin.size else 1.0
+            d["unc_vmax"] = uvmax if uvmax > 0 else 1.0
+
+        # Bias-significance limits: auto-scaled from the data but identical
+        # across components so colours stay comparable
+        pulls = np.concatenate(pulls) if pulls else np.array([])
+        pull_lim = float(np.max(np.abs(pulls))) * 1.05 if pulls.size else 5.0
+        if not pull_lim > 0:
+            pull_lim = 5.0
+
+        fig, axes = plt.subplots(n_peaks, 3,
+                                 figsize=(19, 5 * n_peaks), squeeze=False)
         fig.subplots_adjust(hspace=0.35, wspace=0.25)
 
         for row_idx, pd in enumerate(peak_data):
             if pd is None:
-                axes[row_idx, 0].set_visible(False)
-                axes[row_idx, 1].set_visible(False)
+                for col in range(3):
+                    axes[row_idx, col].set_visible(False)
                 continue
 
             porders, pkcs = pd["porders"], pd["pkcs"]
             dm_grid, unc_grid = pd["dm_grid"], pd["unc_grid"]
             label = pd["label"]
             tag = f" — {label}" if label else ""
+            unc_vmax = pd["unc_vmax"]
+
+            def _annotate(ax, values, fmt, vmin, vmax, white_at_extremes):
+                """Overlay per-cell values when the grid is small enough."""
+                if values.size > 300 or max(values.shape) > 40:
+                    return
+                for oi in range(values.shape[0]):
+                    for ki in range(values.shape[1]):
+                        v = values[oi, ki]
+                        if not np.isfinite(v):
+                            continue
+                        frac = (float(v) - vmin) / (vmax - vmin)
+                        if white_at_extremes:
+                            colour = "w" if abs(frac - 0.5) > 0.32 else "k"
+                        else:
+                            colour = "w" if frac > 0.62 else "k"
+                        ax.text(pkcs[ki], porders[oi], fmt(v),
+                                ha="center", va="center", fontsize=4.5,
+                                color=colour)
 
             kc_step = pkcs[1] - pkcs[0] if len(pkcs) > 1 else 1
             img_ext = [pkcs[0] - 0.5 * kc_step, pkcs[-1] + 0.5 * kc_step,
                        porders[0] - 0.5, porders[-1] + 0.5]
 
-            # Recovered DM
+            # DM_SHRINE (colour scale centred on the input DM, shared limits)
             ax_dm = axes[row_idx, 0]
             if np.any(np.isfinite(dm_grid)):
                 im_dm = ax_dm.imshow(dm_grid, aspect="auto", origin="lower",
                                      cmap="PuOr",
-                                     vmin=dm_centre - dm_half, vmax=dm_centre + dm_half,
+                                     vmin=dm_vmin, vmax=dm_vmax,
                                      extent=img_ext)
-                plt.colorbar(im_dm, ax=ax_dm, label=r"DM [pc cm$^{-3}$]")
+                plt.colorbar(im_dm, ax=ax_dm,
+                             label=r"$\mathrm{DM}_{\rm SHRINE}$ [pc cm$^{-3}$]")
+                _annotate(ax_dm, dm_grid - dm_centre,
+                          lambda v: f"{v:+.3g}",
+                          dm_vmin, dm_vmax, True)
             ax_dm.set_ylabel("Order O")
-            ax_dm.set_title(f"Recovered DM{tag}")
+            ax_dm.set_title(rf"$\mathrm{{DM}}_{{\rm SHRINE}}${tag} "
+                            rf"(centred on input $\pm{dm_half:.3g}$)")
 
-            # Formal uncertainty
-            ax_unc = axes[row_idx, 1]
+            # Significance of deviation from input (bias pull)
+            ax_pull = axes[row_idx, 1]
+            pull_grid = pd["pull_grid"]
+            if np.any(np.isfinite(pull_grid)):
+                im_pull = ax_pull.imshow(pull_grid, aspect="auto",
+                                         origin="lower", cmap="PuOr",
+                                         vmin=-pull_lim, vmax=pull_lim,
+                                         extent=img_ext)
+                plt.colorbar(im_pull, ax=ax_pull,
+                             label=r"$(DM-DM_{\rm in})/\sigma$")
+                _annotate(ax_pull, pull_grid,
+                          lambda v: f"{v:+.2f}", -pull_lim, pull_lim, True)
+            ax_pull.set_ylabel("Order O")
+            ax_pull.set_title(rf"Significance of bias{tag} "
+                              rf"(shared $\pm{pull_lim:.3g}\sigma$)")
+
+            # DM range half-width from relative uncertainty
+            ax_unc = axes[row_idx, 2]
             if np.any(np.isfinite(unc_grid)):
                 im_unc = ax_unc.imshow(unc_grid, aspect="auto", origin="lower",
                                        cmap="Reds", vmin=0, vmax=unc_vmax,
                                        extent=img_ext)
-                plt.colorbar(im_unc, ax=ax_unc, label=r"$\sigma$ [pc cm$^{-3}$]")
-            ax_unc.set_title(f"Formal uncertainty{tag}")
+                plt.colorbar(im_unc, ax=ax_unc,
+                             label=r"$(\Delta_{\rm DM}^{+}{+}|\Delta_{\rm DM}^{-}|)/2$ "
+                                   r"[pc cm$^{-3}$]")
+                _annotate(ax_unc, unc_grid, lambda v: f"{v:.3g}",
+                          0.0, unc_vmax, False)
+            ax_unc.set_title(rf"DM range half-width{tag} "
+                             rf"(max {unc_vmax:.3g})")
 
             # x-label only on bottom row
             if row_idx == n_peaks - 1:
-                ax_dm.set_xlabel("kc")
-                ax_unc.set_xlabel("kc")
+                for ax in (ax_dm, ax_pull, ax_unc):
+                    ax.set_xlabel("kc")
 
             # Overlay default SHRINE reference
             ref = pd["ref"]
@@ -970,7 +1047,7 @@ def plot_sweep_heatmaps(rows, output_dir: Path, ext: str, mode: str, input_dm=0.
                 if not kc_in_grid:
                     star_kc = pkcs[0] if ref_kc < pkcs[0] else pkcs[-1]
 
-                for ax in (ax_dm, ax_unc):
+                for ax in (ax_dm, ax_pull, ax_unc):
                     ax.axhline(y=3, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
                     if kc_in_grid:
                         ax.axvline(x=ref_kc, color="red", linestyle="--", linewidth=0.8, alpha=0.5)

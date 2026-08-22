@@ -134,13 +134,15 @@ def structure_param(i_data: np.ndarray,
     CI_filtered = combined_diag @ np.transpose(CI_data)
     sp = linalg.norm(CI_filtered, axis=0)
 
-    # Uncertainty
+    # Uncertainty (filter through the same combined high-pass x low-pass
+    # that defines the structure parameter, as in maximise_structure.py)
     delta_I = i_data - I_smooth
-    uncertainty = _uncertainty_calc(delta_I, LPF_data, fL_diag)
+    uncertainty = _uncertainty_calc(delta_I, LPF_data, combined_diag)
 
     max_idx = int(np.argmax(sp))
     delta_delta_I = delta_I - delta_I[max_idx]
-    relative_uncertainty = _uncertainty_calc(delta_delta_I, LPF_data, fL_diag)
+    relative_uncertainty = _uncertainty_calc(delta_delta_I, LPF_data,
+                                             combined_diag)
 
     return {
         "sp": sp,
@@ -181,14 +183,15 @@ def structure_param_from_dct(CI_data: np.ndarray,
     CI_filtered = combined_diag @ np.transpose(CI_data)
     sp = linalg.norm(CI_filtered, axis=0)
 
-    # Uncertainty (same recipe as structure_param)
+    # Uncertainty (same combined-filter recipe as structure_param)
     i_data = idct(CI_data, norm="ortho")
     delta_I = i_data - I_smooth
-    uncertainty = _uncertainty_calc(delta_I, LPF_data, fL_diag)
+    uncertainty = _uncertainty_calc(delta_I, LPF_data, combined_diag)
 
     max_idx = int(np.argmax(sp))
     delta_delta_I = delta_I - delta_I[max_idx]
-    relative_uncertainty = _uncertainty_calc(delta_delta_I, LPF_data, fL_diag)
+    relative_uncertainty = _uncertainty_calc(delta_delta_I, LPF_data,
+                                             combined_diag)
 
     return {
         "sp": sp,

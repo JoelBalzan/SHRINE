@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
 """Filter design & order sweep test suite for SHRINE structure maximisation.
 
-Sweeps Butterworth order (O) and spectral cutoff (kc) over a 2-D grid,
-measuring bias, scatter, DM range half-width, and coverage across noise
-realisations (synthetic mode) or on a single real dataset (real mode).
+Sweeps Butterworth order (O) and spectral cutoff (kc) over a 2-D grid.
 
-In both modes the data is handled identically to a real observation:
-the .npy files are loaded, the DM grid is built, dedisperion produces
-I(DM, t), and :func:`struct_max_core.structure_param` evaluates each
-(O, kc) pair.
+Two modes, with deliberately different diagnostics:
+
+* **real** — one observation, components cropped via peak indices. Per-
+  component DM_SHRINE / stability maps plus the differential-DM result:
+  DM2 - DM1, its formal uncertainty sigma_dDM = sqrt(s1^2+s2^2), and the
+  signed significance (DM2-DM1)/sigma_dDM across the (O, kc) grid.
+* **synthetic** — operates exactly like real mode on a user-supplied two-
+  component dynamic spectrum with known component DMs (--true-dms DM1 DM2;
+  --input-dm = prep correction of the sim, usually 0 for raw sims). Noise
+  realisations are added and recovery is judged against the KNOWN truth:
+  accuracy, bias, error calibration (empirical/formal scatter ratio and
+  normalised errors z), and detection sensitivity incl. the false-positive
+  rate. Different injections come from running different sim configs.
 
 Usage examples
 --------------
-# Synthetic sweep using FIRES output as signal template
+# Two-component differential simulation (known truths via --true-dms;
+# --input-dm = prep correction of the sim, usually 0 for raw sims)
 python test_filter_sweep.py --mode synthetic \
-    --fires-dir /path/to/fires_output/ --n-realisations 50
+    --stokes-i ds.npy --freq freq.npy --time time.npy \
+    --true-dms 335.5 336.2 --input-dm 0 \
+    --peak-indices 321 482 491 880 \
+    --dm-min 334 --dm-max 338 --target-snr 300 -n 50
 
-# Real data sweep
+# Real data sweep with differential output (>= 2 peaks required)
 python test_filter_sweep.py --mode real \
-    --fires-dir /path/to/fires_output/ \
-    --dm-min 300 --dm-max 400 --true-dm 335.87
+    --stokes-i ds.npy --freq freq.npy --time time.npy \
+    --input-dm 335.87 --peak-indices 321 482 491 880 \
+    --dm-min 334.87 --dm-max 336.87 --dm-step 0.004
 
-# Or with individual files
-python test_filter_sweep.py --mode real \
-    --stokes-i /path/to/stokes_i.npy \
-    --freq /path/to/freq.npy --time /path/to/time.npy \
-    --dm-min 300 --dm-max 400
-
-# Custom grid
-python test_filter_sweep.py --mode synthetic \
-    --fires-dir /path/to/fires_output/ \
-    -o 1 --o-max 20 --o-step 2 --kc-min 10 --kc-max 100 --kc-step 5
+# Custom filter grid (both modes)
+python test_filter_sweep.py ... -o 1 --o-max 20 --o-step 2 \
+    --kc-min 10 --kc-max 100 --kc-step 5
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ import csv
 import sys
 import time as _time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -51,6 +56,105 @@ from struct_max import _build_dm_values, _Dedisperser
 from struct_max_core import (dm_range_from_relative_uncertainty, get_kc,
                              lowpass_response, recovered_dm, structure_param,
                              structure_param_from_dct)
+
+# ──────────────────────────────────────────────────────────────────────
+# Small shared utilities
+# ──────────────────────────────────────────────────────────────────────
+
+_DM_CONSTANT = 4.148808e6
+_GAUSS_TAIL_3SIG = 2 * (1 - 0.9986501019683699)  # |z|>3 two-sided rate
+
+
+def _save_fig(output_dir: Path, name: str, ext: str, bbox_inches=None):
+    path = output_dir / f"{name}.{ext}"
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches=bbox_inches)
+    plt.close()
+    print(f"Saved {path}")
+
+
+def _robust_rms(x):
+    med = float(np.nanmedian(x))
+    mad = float(np.nanmedian(np.abs(x - med)))
+    return 1.4826 * mad if mad > 0 else float(np.nanstd(x))
+
+
+def rows_to_grid(rows, key, orders=None, kcs=None):
+    """Scatter row dicts into a 2-D (order, kc) grid.
+
+    Returns (grid, orders, kcs); orders/kcs inferred from the rows when not
+    given. Missing cells stay NaN."""
+    if orders is None:
+        orders = sorted(set(r["order"] for r in rows))
+    if kcs is None:
+        kcs = sorted(set(r["kc"] for r in rows))
+    grid = np.full((len(orders), len(kcs)), np.nan)
+    for r in rows:
+        v = r.get(key)
+        if v is not None:
+            grid[orders.index(r["order"]), kcs.index(r["kc"])] = v
+    return grid, orders, kcs
+
+
+def draw_heatmap(ax, grid, kcs, orders, cmap, vmin, vmax, clabel=None,
+                 title=None, xlabel="kc", ylabel="Order O"):
+    """imshow a (order, kc) grid with colourbar; returns True if drawn."""
+    if not np.any(np.isfinite(grid)):
+        if title:
+            ax.set_title(title)
+        return False
+    kc_step = kcs[1] - kcs[0] if len(kcs) > 1 else 1
+    extent = [kcs[0] - 0.5 * kc_step, kcs[-1] + 0.5 * kc_step,
+              orders[0] - 0.5, orders[-1] + 0.5]
+    im = ax.imshow(grid, aspect="auto", origin="lower", cmap=cmap,
+                   vmin=vmin, vmax=vmax, extent=extent,
+                   interpolation="nearest")
+    plt.colorbar(im, ax=ax, label=clabel)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    return True
+
+
+def annotate_cells(ax, kcs, orders, values, fmt, vmin, vmax, mode="seq",
+                   fontsize=4.5):
+    """Overlay per-cell values on a heatmap when the grid is small.
+
+    mode: "seq"      — sequential cmap (white text at high end)
+          "centred"  — diverging cmap centred between vmin/vmax
+                       (white near both extremes)
+          "extremes" — white near the data's own min/max
+    """
+    values = np.asarray(values)
+    if values.size > 300 or max(values.shape) > 40:
+        return
+    scale = max(float(vmax) - float(vmin), 1e-12)
+    fin = values[np.isfinite(values)]
+    dmin, dmax = (float(np.min(fin)), float(np.max(fin))) if fin.size else (0, 0)
+    span = max(dmax - dmin, 1e-12)
+    for oi in range(values.shape[0]):
+        for ki in range(values.shape[1]):
+            v = values[oi, ki]
+            if not np.isfinite(v):
+                continue
+            frac = (float(v) - vmin) / scale
+            if mode == "centred":
+                white = abs(frac - 0.5) > 0.32
+            elif mode == "extremes":
+                white = (abs(float(v) - dmin) < 0.15 * span or
+                         abs(float(v) - dmax) < 0.15 * span)
+            else:
+                white = frac > 0.62
+            ax.text(kcs[ki], orders[oi], fmt(float(v)),
+                    ha="center", va="center", fontsize=fontsize,
+                    color="w" if white else "k")
+
+
+def _progress(done, total, msg):
+    sys.stderr.write(f"\r  [{done}/{total}] {msg}   ")
+    sys.stderr.flush()
+
 
 # ──────────────────────────────────────────────────────────────────────
 # CLI
@@ -73,21 +177,30 @@ def parse_args():
     # Mode
     m = p.add_argument_group("Mode")
     m.add_argument("--mode", choices=["synthetic", "real", "both"], default="synthetic",
-                   help="synthetic = injected-DM tests, real = single file, both = both")
+                   help="synthetic = two-component differential-DM tests, "
+                        "real = single file, both = both")
 
-    # Synthetic parameters
-    s = p.add_argument_group("Synthetic data (uses FIRES output as signal template)")
-    s.add_argument("--fires-dir", default=None,
-                   help="FIRES output directory — clean signal for noise realisations")
-    s.add_argument("--injected-dm", type=float, default=0.0,
-                   help="DM already applied to FIRES data (pc cm^-3)")
+    # Synthetic parameters (two-component differential-DM simulations)
+    s = p.add_argument_group("Synthetic data (two-component differential-DM sims)")
+    s.add_argument("--true-dms", nargs=2, type=float, default=None,
+                   help="Known true DMs of the two simulated components: "
+                        "--true-dms DM1 DM2 [pc cm^-3]. Used as the reference "
+                        "truth for recovery, bias and z statistics.")
     s.add_argument("--n-realisations", "-n", type=int, default=50,
                    help="Noise realisations per (O, kc) in synthetic mode")
-    s.add_argument("--noise-level", type=float, default=1.0,
-                   help="RMS noise to add per realisation (relative to signal std)")
+    s.add_argument("--target-snr", type=float, default=None,
+                   help="FIRES-style analytic noise: derive the SEFD from the "
+                        "clean dynamic spectrum (on-pulse boxcar method) and "
+                        "add per-channel white noise sigma = SEFD / "
+                        "sqrt(n_pol * df * dt) so the on-pulse S/N matches "
+                        "this value. Takes precedence over --noise-level.")
+    s.add_argument("--buffer-frac", type=float, default=1.0,
+                   help="On/off-pulse buffer in units of the pulse width "
+                        "(FIRES buffer_fraction; default 1.0)")
+    s.add_argument("--noise-level", type=float, default=None,
+                   help="Fallback simple noise: RMS relative to data std. "
+                        "Ignored when --target-snr is given")
     s.add_argument("--seed", type=int, default=42, help="Base random seed")
-    s.add_argument("--dm-range-half", type=float, default=5.0,
-                   help="Half-width of delta-DM search range for synthetic data")
 
     # Real data
     r = p.add_argument_group("Real data")
@@ -100,7 +213,9 @@ def parse_args():
     r.add_argument("--dm-step", type=float, default=None, help="DM grid step (overrides auto)")
     r.add_argument("--ndm", type=int, default=None, help="Number of DM grid points (overrides auto)")
     r.add_argument("--input-dm", type=float, default=0.0,
-                   help="DM already applied to real data")
+                   help="DM previously used to correct the full time series "
+                        "[pc cm^-3]. Recovered DMs are only absolute if this "
+                        "matches the correction actually applied to the data.")
     r.add_argument("--ref-freq", type=float, default=None, help="Reference freq [MHz], default is max(freq)")
     r.add_argument("--true-dm", type=float, default=None,
                    help="Known true DM for real data (for bias computation)")
@@ -136,19 +251,9 @@ def parse_args():
 # Shared data-loading helpers (same path for synthetic and real)
 # ──────────────────────────────────────────────────────────────────────
 
-_DM_CONSTANT = 4.148808e6
 
-
-def _load_stokes_i(args, synth_dir=None, synth_label=None):
-    """Return (stokes_i, freq_mhz, time_ms) from CLI args or synthetic .npy files."""
-    if synth_dir is not None:
-        # Load from a directory of .npy files (FIRES or manually saved)
-        fires_path = Path(synth_dir)
-        si = np.load(fires_path / "out_I.npy")
-        freq_mhz = np.load(fires_path / "freq.npy")
-        time_ms = np.load(fires_path / "time.npy")
-        return si, freq_mhz, time_ms
-
+def _load_stokes_i(args):
+    """Return (stokes_i, freq_mhz, time_ms) from CLI args."""
     # ── Real data ──
     derived_freq = derived_time = None
 
@@ -176,7 +281,7 @@ def _load_stokes_i(args, synth_dir=None, synth_label=None):
                 raise SystemExit(f"Error: unrecognised cube shape {cube.shape}")
     else:
         if not args.stokes_i:
-            raise SystemExit("Error: provide --fires-dir, --stokes-i, or --stokes-cube")
+            raise SystemExit("Error: provide --stokes-i or --stokes-cube")
         si = np.load(args.stokes_i)
         if si.ndim == 3:
             from struct_max import _extract_stokes_components
@@ -230,46 +335,6 @@ def _build_dm_grid(freq_mhz, time_ms, dm_min, dm_max, ref_freq=None,
 
     return _build_dm_values((dm_min, dm_max), n_points=100,
                             dm_step=dm_step if dm_step is not None else recommended_step)
-
-
-def _dedisperse_i_dm_t(stokes_i, freq_mhz, time_ms, dm_values, input_dm=0.0):
-    """Dedisperse stokes_i at each trial DM, return I(DM, t)."""
-    n_freq, n_time = stokes_i.shape
-    dt = float(np.median(np.diff(time_ms)))
-    ref_freq = float(np.max(freq_mhz))
-
-    # Compute output size
-    delays_all = []
-    for dm in dm_values:
-        eff = input_dm - dm
-        delays_all.append(
-            _DM_CONSTANT * eff * (1.0 / freq_mhz**2 - 1.0 / ref_freq**2)
-        )
-    delays_all = np.concatenate(delays_all)
-    min_shift = int(np.floor(np.min(delays_all) / dt))
-    max_shift = int(np.ceil(np.max(delays_all) / dt))
-    out_size = n_time + abs(max_shift - min_shift)
-
-    i_dm_t = np.zeros((len(dm_values), out_size), dtype=float)
-
-    for idx, dm in enumerate(dm_values):
-        eff = input_dm - dm
-        delays_ms = _DM_CONSTANT * eff * (1.0 / freq_mhz**2 - 1.0 / ref_freq**2)
-        delay_samp = np.round(delays_ms / dt).astype(int)
-        min_s = int(np.min(delay_samp))
-        counts = np.zeros(out_size, dtype=float)
-
-        for ch in range(n_freq):
-            sh = delay_samp[ch] - min_s
-            cp = min(n_time, out_size - sh)
-            if cp > 0 and 0 <= sh < out_size:
-                i_dm_t[idx, sh : sh + cp] += stokes_i[ch, :cp]
-                counts[sh : sh + cp] += 1.0
-
-        valid = counts > 0
-        i_dm_t[idx, valid] /= counts[valid]
-
-    return i_dm_t
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -422,23 +487,14 @@ def _resolve_peak_regions(args, time_ms, stokes_i):
 # Sweep logic
 # ──────────────────────────────────────────────────────────────────────
 
-def _run_single(args, dm_values, stokes_i, freq_mhz, time_ms, input_dm=0.0):
-    """Dedisperse once and return the I(DM, t) array (reused across O/kc)."""
-    return _dedisperse_i_dm_t(stokes_i, freq_mhz, time_ms, dm_values, input_dm)
-
-
-def _eval_one(i_dm_t, dm_values, order, kc, CI_data=None):
+def _eval_one(dm_values, order, kc, CI_data):
     """Run structure_param for one (O, kc) and return metrics.
 
     If *CI_data* (pre-computed DCT of i_dm_t) is provided, uses the fast
     :func:`structure_param_from_dct` path to avoid redundant DCTs.
     """
-    if CI_data is not None:
-        result = structure_param_from_dct(CI_data, kc=kc, order=order)
-        result["dm_data"] = dm_values
-    else:
-        result = structure_param(i_dm_t, order=order, kc=kc)
-        result["dm_data"] = dm_values
+    result = structure_param_from_dct(CI_data, kc=kc, order=order)
+    result["dm_data"] = dm_values
     dm_best = recovered_dm(result["dm_data"], result["sp"])
     low_dm, high_dm = dm_range_from_relative_uncertainty(
         result["sp"], result["relative_uncertainty"], result["dm_data"]
@@ -449,125 +505,553 @@ def _eval_one(i_dm_t, dm_values, order, kc, CI_data=None):
     return dm_best, formal_unc, unc_minus, unc_plus
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Synthetic sweep
-# ──────────────────────────────────────────────────────────────────────
-
-def run_synthetic_sweep(args, output_dir: Path):
-    if not args.fires_dir:
-        raise SystemExit("Error: --fires-dir required for synthetic mode "
-                         "(provide a FIRES output directory)")
-
+def _sweep_grids(args):
+    """Order and kc axes of the sweep, from CLI bounds."""
     orders = list(range(args.o_min, args.o_max + 1, args.o_step))
     kc_values = list(range(args.kc_min, args.kc_max + 1, args.kc_step))
+    return orders, kc_values
+
+
+def _prepare_component(args, stokes_i, freq_mhz, time_ms, window,
+                       dedisperser):
+    """Dedisperse one peak window over the DM grid and DCT it (done once per
+    component; the O/kc sweep then runs on the coefficients).
+
+    Returns (dm_values, CI_data)."""
+    s, e = window
+    tm_peak = time_ms[s:e]
+    dm_values = _build_dm_grid(freq_mhz, tm_peak, args.dm_min, args.dm_max,
+                               ref_freq=args.ref_freq,
+                               dm_step=args.dm_step, ndm=args.ndm)
+    output_size = dedisperser.max_output_size_for_dm_range(
+        stokes_i[:, s:e], (args.dm_min, args.dm_max))
+    i_dm_t = np.zeros((len(dm_values), output_size), dtype=float)
+    for idx, dm in enumerate(dm_values):
+        dedisp = dedisperser.dedisperse(
+            stokes_i[:, s:e], dm, output_size=output_size,
+            mode=args.dedisp_mode)
+        i_dm_t[idx] = np.nansum(dedisp, axis=0)
+    print(f"  I(DM,t) shape: {i_dm_t.shape}  "
+          f"(DM grid {len(dm_values)} pts [{dm_values[0]:.3g}, "
+          f"{dm_values[-1]:.3g}], out {output_size})")
+    CI_data = dct(i_dm_t, norm="ortho")
+    return dm_values, CI_data
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Synthetic sweep — two-component differential-DM simulations
+# ──────────────────────────────────────────────────────────────────────
+
+def _boxcar_window(profile, frac=0.95):
+    """Contiguous window around the brightest bin containing *frac* of the
+    total profile energy (port of FIRES' boxcar_width). Returns (left, right)
+    inclusive bin indices."""
+    prof = np.where(np.isfinite(profile), profile, 0.0)
+    peak = int(np.argmax(prof))
+    total = float(prof.sum())
+    if total <= 0:
+        return 0, len(prof) - 1
+    lo = hi = peak
+    captured = float(prof[peak])
+    while captured < frac * total and (lo > 0 or hi < len(prof) - 1):
+        lv = prof[lo - 1] if lo > 0 else -np.inf
+        rv = prof[hi + 1] if hi < len(prof) - 1 else -np.inf
+        if lv >= rv:
+            lo -= 1
+            captured += float(lv)
+        else:
+            hi += 1
+            captured += float(rv)
+    return lo, hi
+
+
+def _onpulse_snr(stokes_i, left, right, buffer_bins):
+    """Measured on-pulse S/N of a noisy Stokes-I dynamic spectrum: energy in
+    the on-pulse boxcar divided by robust off-pulse RMS (FIRES snr_onpulse).
+    The buffer only excludes off-pulse bins near the pulse."""
+    profile = np.nansum(stokes_i, axis=0)
+    lo = max(left - buffer_bins, 0)
+    hi = min(right + buffer_bins, profile.size - 1)
+    off_mask = np.ones(profile.size, dtype=bool)
+    off_mask[lo:hi + 1] = False
+    on = profile[left:right + 1]
+    n_on = on.size
+    off = profile[off_mask]
+    if off.size == 0 or n_on <= 0:
+        return np.nan
+    sigma = _robust_rms(off)
+    if not np.isfinite(sigma) or sigma <= 0:
+        return np.nan
+    return float(np.nansum(on) / (sigma * np.sqrt(n_on)))
+
+
+def _fires_noise_setup(stokes_i, freq_mhz, time_ms, target_snr,
+                       buffer_frac=1.0, n_pol=2):
+    """Analytic SEFD derivation (port of FIRES compute_required_sefd).
+
+    Finds the 95%-energy boxcar of the Stokes-I pulse profile, then solves
+        sefd = F_on * sqrt(n_pol * df * dt) / (SNR * sqrt(N_chan * N_on))
+    so that adding white noise with sigma_ch = sefd / sqrt(n_pol * df * dt)
+    yields on-pulse S/N ~= target_snr.
+
+    Returns (sigma_ch, info) with sigma_ch the per-channel noise std.
+    """
+    profile = np.nansum(stokes_i, axis=0)
+    left, right = _boxcar_window(profile, frac=0.95)
+    n_chan = stokes_i.shape[0]
+    n_on = right - left + 1
+    F_on = float(np.nansum(profile[left:right + 1]))
+    if F_on <= 0 or n_on <= 0:
+        raise SystemExit("Error: insufficient on-pulse energy for SEFD "
+                         "estimation (--target-snr)")
+    ch_bw_hz = float(np.median(np.abs(np.diff(freq_mhz)))) * 1e6
+    t_res_s = float(np.median(np.abs(np.diff(time_ms)))) / 1000.0
+    buffer_bins = max(int(float(buffer_frac) * n_on), 0)
+    sefd = F_on * np.sqrt(n_pol * ch_bw_hz * t_res_s) \
+        / (target_snr * np.sqrt(n_chan * n_on))
+    sigma_ch = sefd / np.sqrt(n_pol * np.full(n_chan, ch_bw_hz) * t_res_s)
+    info = {"left": left, "right": right, "n_on": n_on, "F_on": F_on,
+            "ch_bw_hz": ch_bw_hz, "t_res_s": t_res_s, "sefd": sefd,
+            "buffer_bins": buffer_bins}
+    return sigma_ch, info
+
+
+def run_synthetic_differential(args, output_dir: Path):
+    """Two-component simulation operating exactly like the real pipeline.
+
+    The user supplies a NOISELESS dynamic spectrum (e.g. FIRES output) with
+    two components whose true DMs are known, crops them with peak indices,
+    and passes the truths via --true-dms DM1 DM2. --input-dm is the DM at
+    which the simulated time series was pre-corrected (0 for raw sims).
+    Every run adds a fresh noise realisation; both windows are dedispersed
+    and evaluated over the same (O, kc) grid as real mode, and recovery is
+    judged against the true component DMs and their difference
+    dDM_inj = DM2 - DM1. Different injections come from running different
+    FIRES configs, not from this script.
+
+    Returns (rows, meta): rows carry per-(O, kc) aggregates; meta holds the
+    pooled z scores and false-positive count for the plots.
+    """
+    orders, kc_values = _sweep_grids(args)
     n_reals = args.n_realisations
-    seed_base = args.seed
 
     print(f"\n{'=' * 70}")
-    print(f"SYNTHETIC SWEEP: {len(orders)} orders x {len(kc_values)} kc "
-          f"x {n_reals} realisations = {len(orders)*len(kc_values)*n_reals} runs")
+    print(f"SYNTHETIC DIFFERENTIAL SWEEP: {n_reals} realisations x "
+          f"{len(orders)} O x {len(kc_values)} kc")
     print(f"{'=' * 70}")
 
-    # Load FIRES output as signal template
-    fires_path = Path(args.fires_dir)
-    signal = np.load(fires_path / "out_I.npy")
-    freq_mhz = np.load(fires_path / "freq.npy")
-    time_ms  = np.load(fires_path / "time_ms.npy") if (fires_path / "time_ms.npy").exists() \
-               else np.load(fires_path / "time.npy")
-    print(f"  Signal shape: {signal.shape}  "
-          f"Freq: {freq_mhz[0]:.1f}-{freq_mhz[-1]:.1f} MHz  "
-          f"Time: {time_ms[0]:.3f}-{time_ms[-1]:.3f} ms")
+    stokes_i, freq_mhz, time_ms = _load_stokes_i(args)
+    print(f"  Shape: {stokes_i.shape}  "
+          f"Freq: {freq_mhz[0]:.1f}-{freq_mhz[-1]:.1f} MHz")
 
-    # DM grid centred on 0 (delta-DM relative to input_dm)
-    dm_half = args.dm_range_half
-    dm_values = np.linspace(-dm_half, dm_half, 300)
-    print(f"  DM grid: {len(dm_values)} points, "
-          f"[{dm_values[0]:.3f}, {dm_values[-1]:.3f}] pc cm^-3")
+    peak_regions = _resolve_peak_regions(args, time_ms, stokes_i)
+    if len(peak_regions) < 2:
+        raise SystemExit("Error: synthetic differential sims require >= 2 "
+                         "peak regions (use --peak-indices)")
+    if args.true_dms is None or len(args.true_dms) != 2:
+        raise SystemExit("Error: --true-dms DM1 DM2 required for synthetic "
+                         "mode (known component DMs)")
+    T1, T2 = float(args.true_dms[0]), float(args.true_dms[1])
+    dd_inj = T2 - T1
+    input_dm = float(args.input_dm)
 
-    # Scale signal so its RMS = 1 (noise will be added at level args.noise_level)
-    sig_rms = float(np.std(signal))
-    if sig_rms > 0:
-        signal_scaled = signal / sig_rms
+    if args.dm_min is None or args.dm_max is None:
+        raise SystemExit("Error: --dm-min and --dm-max required for "
+                         "synthetic mode")
+
+    # Static per-component setup: DM grids, dedispersers and output sizes
+    # are built once; each realisation re-dedisperses its own noisy cube
+    # through them. One shared input DM (the sim's prep correction),
+    # exactly like the real pipeline.
+    comps = []
+    for pi in range(2):
+        s, e = peak_regions[pi]
+        tm_peak = time_ms[s:e]
+        dm_values = _build_dm_grid(freq_mhz, tm_peak, args.dm_min,
+                                   args.dm_max, ref_freq=args.ref_freq,
+                                   dm_step=args.dm_step, ndm=args.ndm)
+        dedisperser = _Dedisperser(
+            stokes_i, freq_mhz, time_ms,
+            input_dm=input_dm,
+            reference_freq=args.ref_freq,
+            seed=args.seed,
+        )
+        out_size = dedisperser.max_output_size_for_dm_range(
+            stokes_i[:, s:e], (args.dm_min, args.dm_max))
+        comps.append({"window": (s, e), "dms": dm_values,
+                      "dedisp": dedisperser, "out_size": out_size})
+        print(f"  Component {pi+1}: window {s}-{e}, true DM {[T1, T2][pi]}, "
+              f"grid {len(dm_values)} pts [{dm_values[0]:.2f}, "
+              f"{dm_values[-1]:.2f}]")
+    print(f"  Input DM (prep correction): {input_dm}; "
+          f"dDM_inj = {dd_inj:+.4g} pc cm^-3")
+
+    # Noise model: FIRES analytic S/N matching (preferred) or simple
+    # data-std scaling as fallback.
+    snr_measured = []
+    ninfo = None
+    sigma_ch = None
+    if args.target_snr is not None and args.target_snr > 0:
+        sigma_ch, ninfo = _fires_noise_setup(
+            stokes_i, freq_mhz, time_ms, args.target_snr,
+            buffer_frac=args.buffer_frac)
+        noise_sigma = None
+        print(f"  Noise: FIRES analytic mode (target S/N {args.target_snr:g})")
+        print(f"    on-pulse boxcar [{ninfo['left']}, {ninfo['right']}] "
+              f"(N_on={ninfo['n_on']}), F_on={ninfo['F_on']:.4g}")
+        print(f"    df={ninfo['ch_bw_hz']/1e6:.3f} MHz, "
+              f"dt={ninfo['t_res_s']*1e3:.3f} ms -> "
+              f"SEFD={ninfo['sefd']:.4g} Jy")
+        print(f"    per-channel sigma = {float(np.mean(sigma_ch)):.4g} "
+              f"(uniform)")
+    elif args.noise_level is not None:
+        sigma_ch = None
+        noise_sigma = args.noise_level * float(np.std(stokes_i))
+        print(f"  Noise sigma: {noise_sigma:.4g} "
+              f"({args.noise_level:.3g} x data std)")
     else:
-        signal_scaled = signal
+        raise SystemExit("Error: specify --target-snr (FIRES analytic noise) "
+                         "or --noise-level (simple relative noise)")
 
-    rows = []
-    total = len(orders) * len(kc_values)
-    first_CI = None
+    n_dedisp = n_reals * sum(len(c["dms"]) for c in comps)
+    print(f"  Dedispersal calls planned: {n_dedisp}")
 
-    # Collect results per (order, kc) across realisations
     from collections import defaultdict
-    collect = defaultdict(lambda: {"dms": [], "uncs": []})
+    collect = defaultdict(lambda: {"diffs": [], "sigmas": [],
+                                   "u1s": [], "u2s": [],
+                                   "dm1s": [], "dm2s": []})
+    z_pool = []
+    fp_counts = [0, 0]
+
     done = 0
+    for ridx in range(n_reals):
+        rng = np.random.default_rng([args.seed, ridx])
+        clean = np.asarray(stokes_i, dtype=float)
+        if sigma_ch is not None:
+            noise = rng.standard_normal(np.shape(clean)) * sigma_ch[:, None]
+        else:
+            noise = rng.standard_normal(np.shape(clean)) * noise_sigma
+        noisy = clean + noise
+        if ninfo is not None:
+            snr_measured.append(_onpulse_snr(
+                noisy, ninfo["left"], ninfo["right"], ninfo["buffer_bins"]))
 
-    for real in range(n_reals):
-        rng = np.random.default_rng(seed_base + real)
-        noise = rng.standard_normal(signal.shape) * args.noise_level
-        noisy = signal_scaled + noise
-
-        i_dm_t = _dedisperse_i_dm_t(noisy, freq_mhz, time_ms,
-                                    dm_values, input_dm=args.injected_dm)
-        CI_data = dct(i_dm_t, norm="ortho")
-        if first_CI is None:
-            first_CI = CI_data
+        CIs = []
+        for c in comps:
+            s, e = c["window"]
+            i_dm_t = np.zeros((len(c["dms"]), c["out_size"]), dtype=float)
+            for idx, dm in enumerate(c["dms"]):
+                dedisp = c["dedisp"].dedisperse(
+                    noisy[:, s:e], dm,
+                    output_size=c["out_size"], mode=args.dedisp_mode)
+                i_dm_t[idx] = np.nansum(dedisp, axis=0)
+            CIs.append((dct(i_dm_t, norm="ortho"), c["dms"]))
 
         for order in orders:
             for kc in kc_values:
                 try:
-                    dm_best, formal_unc, unc_minus, unc_plus = _eval_one(
-                        i_dm_t, dm_values, order, kc, CI_data=CI_data)
+                    dm1, u1, _, _ = _eval_one(CIs[0][1], order, kc, CIs[0][0])
+                    dm2, u2, _, _ = _eval_one(CIs[1][1], order, kc, CIs[1][0])
                 except Exception:
                     continue
-                collect[(order, kc)]["dms"].append(dm_best)
-                collect[(order, kc)]["uncs"].append(formal_unc)
-                collect[(order, kc)]["uncs_minus"].append(unc_minus)
-                collect[(order, kc)]["uncs_plus"].append(unc_plus)
+                sig = float(np.hypot(u1, u2))
+                diff = float(dm2 - dm1)
+                cell = collect[(order, kc)]
+                cell["diffs"].append(diff)
+                cell["sigmas"].append(sig)
+                cell["u1s"].append(float(u1))
+                cell["u2s"].append(float(u2))
+                cell["dm1s"].append(float(dm1))
+                cell["dm2s"].append(float(dm2))
+                z_pool.append((diff - dd_inj) / sig if sig > 0 else np.nan)
+                S = abs(diff) / sig if sig > 0 else np.nan
+                fp_counts[1] += 1
+                if np.isfinite(S) and S > 3:
+                    fp_counts[0] += 1
 
-    plot_dct_spectrum(first_CI, output_dir, args.ext, tag="synthetic")
-
-    done = 0
-    for order in orders:
-        for kc in kc_values:
-            done += 1
-            dms_recovered = collect[(order, kc)]["dms"]
-            form_uncs = collect[(order, kc)]["uncs"]
-
-            if not dms_recovered:
-                if args.verbose:
-                    sys.stderr.write(f"\r  [{done}/{total}] O={order:2d} kc={kc:3d}  FAILED   \n")
-                    sys.stderr.flush()
-                continue
-
-            dms = np.array(dms_recovered)
-            uncs = np.array(form_uncs)
-            bias = float(np.mean(dms - args.injected_dm))
-            scatter = float(np.std(dms))
-            mean_unc = float(np.mean(uncs))
-            mean_unc_minus = float(np.mean(collect[(order, kc)]["uncs_minus"]))
-            mean_unc_plus = float(np.mean(collect[(order, kc)]["uncs_plus"]))
-            within = np.abs(dms - args.injected_dm) <= uncs
-            coverage = float(np.mean(within))
-
-            rows.append({
-                "order": order,
-                "kc": kc,
-                "bias": bias,
-                "scatter": scatter,
-                "mean_formal_unc": mean_unc,
-                "mean_unc_minus": mean_unc_minus,
-                "mean_unc_plus": mean_unc_plus,
-                "coverage": coverage,
-                "n_realisations": len(dms),
-                "mean_recovered_dm": float(np.mean(dms)),
-            })
-
-            sys.stderr.write(f"\r  [{done}/{total}] O={order:2d} kc={kc:3d}  "
-                             f"bias={bias:+.6f}  scatter={scatter:.6f}  "
-                             f"form_unc={mean_unc:.6f}  coverage={coverage:.1%}  ")
-            sys.stderr.flush()
+        done += 1
+        _progress(done, n_reals,
+                  f"realisation {ridx+1}/{n_reals}")
 
     sys.stderr.write("\n")
-    return rows
+
+    rows = []
+    for (order, kc), cell in sorted(collect.items()):
+        diffs = np.array(cell["diffs"])
+        sigs = np.array(cell["sigmas"])
+        u1s = np.array(cell["u1s"])
+        u2s = np.array(cell["u2s"])
+        dm1s = np.array(cell["dm1s"])
+        dm2s = np.array(cell["dm2s"])
+        mean_diff = float(np.mean(diffs))
+        sigma_emp = float(np.std(diffs))
+        mf = float(np.mean(sigs))
+        z = (diffs - dd_inj) / sigs
+        S = np.abs(diffs) / sigs
+        rows.append({
+            "dmdm_inj": dd_inj,
+            "order": order,
+            "kc": kc,
+            "mean_diff": mean_diff,
+            "bias": mean_diff - dd_inj,
+            "sigma_empirical": sigma_emp,
+            "sigma_formal_mean": mf,
+            "r_sigma": (sigma_emp / mf) if mf > 0 else np.nan,
+            "z_std": float(np.std(z)),
+            "coverage": float(np.mean(np.abs(diffs - dd_inj) <= sigs)),
+            "frac_S_gt3": float(np.mean(S > 3)),
+            "n_realisations": len(diffs),
+            "sigma1_formal_mean": float(np.mean(u1s)),
+            "sigma2_formal_mean": float(np.mean(u2s)),
+            "dm1_scatter": float(np.std(dm1s - T1)) if len(dm1s) else np.nan,
+            "dm2_scatter": float(np.std(dm2s - T2)) if len(dm2s) else np.nan,
+        })
+
+    meta = {
+        "orders": orders,
+        "kcs": kc_values,
+        "true_dms": (T1, T2),
+        "dd_inj": dd_inj,
+        "z_pool": np.array(z_pool),
+        "fp_counts": fp_counts,
+        "target_snr": args.target_snr,
+        "snr_measured_mean": (float(np.mean(snr_measured))
+                              if snr_measured else None),
+    }
+    _print_sim_summary(args, rows, meta, snr_measured)
+    return rows, meta
+
+
+def _print_sim_summary(args, rows, meta, snr_measured):
+    """Compact post-run statistics: measured S/N plus pooled recovery,
+    calibration and detection numbers across the (O, kc) grid."""
+    if not rows:
+        return
+    z = meta["z_pool"]
+    z = z[np.isfinite(z)]
+    n_fp, n_tot = meta["fp_counts"]
+
+    print(f"\n{'─' * 26} SYNTHETIC RUN SUMMARY {'─' * 26}")
+    print(f"  Truth: DM1={meta['true_dms'][0]:+.4g}, "
+          f"DM2={meta['true_dms'][1]:+.4g}  ->  "
+          f"dDM_inj = {meta['dd_inj']:+.4g} pc cm^-3")
+    if args.target_snr is not None:
+        noise_desc = f"FIRES analytic, target S/N {args.target_snr:g}"
+    else:
+        noise_desc = f"simple {args.noise_level:.3g} x data std"
+    print(f"  Noise: {noise_desc}; "
+          f"{len(rows)} of {len(meta['orders']) * len(meta['kcs'])} "
+          f"(O, kc) cells evaluated")
+
+    if snr_measured:
+        sm = np.array([s for s in snr_measured if np.isfinite(s)])
+        if sm.size:
+            print(f"  Measured S/N : mean {sm.mean():.1f}  median "
+                  f"{np.median(sm):.1f}  std {sm.std():.1f}  "
+                  f"range [{sm.min():.1f}, {sm.max():.1f}] (N={sm.size})")
+
+    bias = np.array([r["bias"] for r in rows])
+    semp = np.array([r["sigma_empirical"] for r in rows])
+    sform = np.array([r["sigma_formal_mean"] for r in rows])
+    rsig = np.array([r["r_sigma"] for r in rows])
+    cov = np.array([r["coverage"] for r in rows])
+    with np.errstate(invalid="ignore"):
+        print(f"  Delta-DM recovery (median over cells unless stated):")
+        print(f"    bias         : median {np.nanmedian(bias):+.4g}   "
+              f"mean {np.nanmean(bias):+.4g}   "
+              f"|max| {np.nanmax(np.abs(bias)):.4g} pc cm^-3")
+        print(f"    sigma empir. : median {np.nanmedian(semp):.4g}   "
+              f"(best cell {np.nanmin(semp):.4g})")
+        print(f"    sigma formal : median {np.nanmedian(sform):.4g}   "
+              f"mean {np.nanmean(sform):.4g} pc cm^-3")
+        print(f"    R_sigma      : median {np.nanmedian(rsig):.3f}   "
+              f"range [{np.nanmin(rsig):.3f}, {np.nanmax(rsig):.3f}]")
+        print(f"  Calibration:")
+        print(f"    z-score      : mean {z.mean():+.3f}  std {z.std():.3f}  "
+              f"|z|>3: {(np.abs(z) > 3).mean():.2%} (N={z.size})")
+        print(f"    coverage     : median {np.nanmedian(cov):.1%}   "
+              f"min {np.nanmin(cov):.1%}")
+    fp_frac = n_fp / n_tot if n_tot else float("nan")
+    print(f"  Detection:")
+    print(f"    S>3 rate     : {fp_frac:.2%} of trials "
+          f"(Gaussian expectation {_GAUSS_TAIL_3SIG:.2%}; "
+          f"n={n_fp}/{n_tot})")
+    print("─" * 78)
+
+
+def plot_sim_recovery(rows, meta, output_dir: Path, ext: str):
+    """Sim plot 1: distribution of recovered dDM over the (O, kc) grid
+    against the known truth, plus the bias heatmap."""
+    if not rows:
+        return
+    dd_inj = meta["dd_inj"]
+    means = np.array([r["mean_diff"] for r in rows])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+
+    ax = axes[0]
+    ax.hist(means, bins=30, alpha=0.75, color="C0", edgecolor="k",
+            linewidth=0.4)
+    ax.axvline(dd_inj, color="k", linestyle="--", linewidth=1.2,
+               label=f"truth $={dd_inj:+.3g}$")
+    med = float(np.median(means))
+    ax.axvline(med, color="C1", linewidth=1.0, label=f"median $={med:+.4f}$")
+    closest = float(np.nanmin(np.abs(means - dd_inj)))
+    ax.set_xlabel(r"Recovered $\langle\Delta\mathrm{DM}_{21}\rangle$ "
+                  "[pc cm$^{-3}$]")
+    ax.set_ylabel("Cells in (O, kc) grid")
+    ax.set_title(r"$\Delta\mathrm{DM}_{21}=\mathrm{DM}_2-\mathrm{DM}_1$"
+                 f" across {len(rows)} (O, kc) settings"
+                 f"\n(closest cell within {closest:.2g} of truth)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    bias_g, orders, kcs = rows_to_grid(rows, "bias", meta["orders"],
+                                       meta["kcs"])
+    vabs = np.nanmax(np.abs(bias_g)) * 1.05 or 1e-3
+    draw_heatmap(axes[1], bias_g, kcs, orders, "RdBu_r", -vabs, vabs,
+                 clabel=r"$b$ [pc cm$^{-3}$]",
+                 title=r"$b=\langle\Delta\mathrm{DM}_{21}^{\,\rm rec}\rangle"
+                       r"-\Delta\mathrm{DM}_{21}^{\,\rm inj}$")
+    axes[1].axhline(y=3, color="k", linestyle="--", linewidth=0.7, alpha=0.5)
+    _save_fig(output_dir, "sim_recovery", ext)
+
+
+def plot_sim_calibration(rows, meta, output_dir: Path, ext: str):
+    """Sim calibration figure (2 cols x 3 rows): per-component formal
+    uncertainties, pooled empirical vs formal differential scatter, then
+    the calibration ratio map and normalised-error distribution."""
+    if not rows:
+        return
+    fig, axes = plt.subplots(3, 2, figsize=(14, 17))
+    orders, kcs = meta["orders"], meta["kcs"]
+
+    def _mean_map(key):
+        g = np.full((len(orders), len(kcs)), np.nan)
+        for row in rows:
+            g[orders.index(row["order"]), kcs.index(row["kc"])] = row[key]
+        return g
+
+    # Row 1: per-component formal uncertainties on a shared colour scale
+    s1_map = _mean_map("sigma1_formal_mean")
+    s2_map = _mean_map("sigma2_formal_mean")
+    smax = 1.05 * float(np.nanmax([np.nanmax(s1_map), np.nanmax(s2_map)])
+                        ) or 1.0
+    draw_heatmap(axes[0, 0], s1_map, kcs, orders, "viridis", 0.0, smax,
+                 clabel=r"$\sigma_1$ [pc cm$^{-3}$]",
+                 title=r"Component 1 formal uncertainty"
+                       "\n"
+                       r"$\sigma_1=\langle u_1\rangle_{\rm realisations}$")
+    draw_heatmap(axes[0, 1], s2_map, kcs, orders, "viridis", 0.0, smax,
+                 clabel=r"$\sigma_2$ [pc cm$^{-3}$]",
+                 title=r"Component 2 formal uncertainty"
+                       "\n"
+                       r"$\sigma_2=\langle u_2\rangle_{\rm realisations}$")
+
+    # Row 2: pooled differential scatter, empirical vs formal
+    # (shared colour scale so the two maps are directly comparable)
+    se_map = _mean_map("sigma_empirical")
+    sf_map = _mean_map("sigma_formal_mean")
+    dmax = 1.05 * float(np.nanmax([np.nanmax(se_map), np.nanmax(sf_map)])
+                        ) or 1.0
+    draw_heatmap(axes[1, 0], se_map, kcs, orders, "viridis", 0.0, dmax,
+                 clabel=r"$\sigma_{\rm empirical}$ [pc cm$^{-3}$]",
+                 title=r"Empirical differential scatter"
+                       "\n"
+                       r"$\sigma_{\rm empirical}=\mathrm{std}("
+                       r"\Delta\mathrm{DM}_{21})$")
+    draw_heatmap(axes[1, 1], sf_map, kcs, orders, "viridis", 0.0, dmax,
+                 clabel=r"$\langle\sigma_{\rm formal}\rangle$ "
+                        r"[pc cm$^{-3}$]",
+                 title=r"Mean formal differential uncertainty"
+                       "\n"
+                       r"$\langle\sigma_{\rm formal}\rangle="
+                       r"\langle\sqrt{\sigma_1^2+\sigma_2^2}\rangle$")
+
+    # Row 3: calibration ratio + z distribution
+    r_map = np.full((len(orders), len(kcs)), np.nan)
+    counts = np.zeros((len(orders), len(kcs)))
+    for row in rows:
+        oi, ki = orders.index(row["order"]), kcs.index(row["kc"])
+        if np.isfinite(row["r_sigma"]):
+            r_map[oi, ki] = ((r_map[oi, ki] if np.isfinite(r_map[oi, ki])
+                              else 0.0) + row["r_sigma"])
+            counts[oi, ki] += 1
+    r_map = np.where(counts > 0, r_map / np.maximum(counts, 1), np.nan)
+    draw_heatmap(axes[2, 0], r_map, kcs, orders, "coolwarm",
+                 vmin=0, vmax=None,
+                 clabel=r"$R_\sigma$",
+                 title=r"$R_\sigma=\sigma_{\rm empirical}/"
+                       r"\langle\sigma_{\rm formal}\rangle$"
+                       "\n(1 = well calibrated, >1 = overconfident, "
+                       "<1 = conservative)")
+    axes[2, 0].axhline(y=3, color="k", linestyle="--", linewidth=0.7,
+                       alpha=0.5)
+
+    z = meta["z_pool"]
+    z = z[np.isfinite(z)]
+    ax = axes[2, 1]
+    ax.hist(z, bins=60, range=(-6, 6), density=True, alpha=0.7,
+            color="C0", edgecolor="k", linewidth=0.3)
+    xs = np.linspace(-6, 6, 300)
+    ax.plot(xs, np.exp(-0.5 * xs**2) / np.sqrt(2 * np.pi), "k--",
+            linewidth=1.2, label=r"$\mathcal{N}(0,1)$")
+    frac3 = float(np.mean(np.abs(z) > 3))
+    ax.set_xlabel(r"$z$")
+    ax.set_ylabel("Probability density")
+    ax.set_title(r"$z=\left(\Delta\mathrm{DM}_{21}^{\,\rm rec}-"
+                 r"\Delta\mathrm{DM}_{21}^{\,\rm inj}\right)/"
+                 r"\sigma_{\rm formal}$"
+                 f"\nN={z.size}, std={np.std(z):.3f}, "
+                 f"|z|>3: {frac3:.2%}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    _save_fig(output_dir, "sim_calibration", ext)
+
+
+def plot_sim_sensitivity(rows, meta, output_dir: Path, ext: str):
+    """Sim plot 4: significance behaviour at this injection -- distribution
+    of per-cell S and the false-positive rate versus Gaussian expectation."""
+    if not rows:
+        return
+
+    s_cells = np.array([abs(r["mean_diff"]) /
+                        max(r["sigma_formal_mean"], 1e-12) for r in rows])
+
+    n_fp, n_tot = meta["fp_counts"]
+    fp_frac = n_fp / n_tot if n_tot else np.nan
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 5))
+
+    ax = axes[0]
+    ax.hist(s_cells, bins=25, alpha=0.75, color="C0", edgecolor="k",
+            linewidth=0.4)
+    ax.axvline(3, color="k", linestyle="--", linewidth=1,
+               label=r"3$\sigma$ threshold")
+    ax.set_xlabel(r"$S_\Delta$ (per-cell median over realisations)")
+    ax.set_ylabel("Cells in (O, kc) grid")
+    ax.set_title(r"Detection significance: "
+                 r"$S_\Delta=|\Delta\mathrm{DM}_{21}^{\,\rm rec}|/"
+                 r"\sqrt{\sigma_1^2+\sigma_2^2}$"
+                 "\nat "
+                 rf"$\Delta\mathrm{{DM}}_{{\rm inj}}="
+                 rf"{meta['dd_inj']:+.3g}$")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    bars = ax.bar(["observed", "Gaussian\nexpectation"],
+                  [100 * fp_frac, 100 * _GAUSS_TAIL_3SIG],
+                  color=["C3", "0.7"], width=0.55)
+    for b, v in zip(bars, [fp_frac, _GAUSS_TAIL_3SIG]):
+        ax.annotate(f"{v:.3%}", xy=(b.get_x() + b.get_width() / 2,
+                    b.get_height()), ha="center", va="bottom", fontsize=10)
+    ax.set_ylabel(r"Fraction of trials with $S_\Delta>3$ [%]")
+    ax.set_ylim(0, max(fp_frac, _GAUSS_TAIL_3SIG) * 130 or 1)
+    ax.set_title(r"False-positive rate vs "
+                 r"$P(|z|>3)=2\Phi(-3)\approx0.27\%$")
+    ax.grid(True, axis="y", alpha=0.3)
+    _save_fig(output_dir, "sim_sensitivity", ext)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -575,8 +1059,7 @@ def run_synthetic_sweep(args, output_dir: Path):
 # ──────────────────────────────────────────────────────────────────────
 
 def run_real_sweep(args, output_dir: Path):
-    orders = list(range(args.o_min, args.o_max + 1, args.o_step))
-    kc_values = list(range(args.kc_min, args.kc_max + 1, args.kc_step))
+    orders, kc_values = _sweep_grids(args)
 
     print(f"\n{'=' * 70}")
     print(f"REAL DATA SWEEP: {len(orders)} orders x {len(kc_values)} kc values")
@@ -586,13 +1069,6 @@ def run_real_sweep(args, output_dir: Path):
     print(f"  Shape: {stokes_i.shape}  "
           f"Freq: {freq_mhz[0]:.1f}-{freq_mhz[-1]:.1f} MHz")
 
-    #plt.imshow(stokes_i, aspect="auto", extent=(time_ms[0], time_ms[-1], freq_mhz[0], freq_mhz[-1]), origin="lower", cmap="plasma")
-    #plt.xlabel("Time (ms)")
-    #plt.ylabel("Frequency (MHz)")
-    #plt.show()
-
-    dt = float(np.median(np.diff(time_ms)))
-    # Peak selection
     print("\nPeak selection...")
     peak_regions = _resolve_peak_regions(args, time_ms, stokes_i)
 
@@ -600,7 +1076,8 @@ def run_real_sweep(args, output_dir: Path):
         raise SystemExit("Error: --dm-min and --dm-max required for real mode")
 
     # Shared dedisperser mirroring DMOptimiser exactly (noise stats from the
-    # FULL time axis, seeded fill, endpoint-based output sizing).
+    # FULL time axis, seeded fill, endpoint-based output sizing). One input
+    # DM for the whole file: the DM used to pre-correct the time series.
     dedisperser = _Dedisperser(
         stokes_i, freq_mhz, time_ms,
         input_dm=args.input_dm,
@@ -612,43 +1089,12 @@ def run_real_sweep(args, output_dir: Path):
 
     for pi, (start, end) in enumerate(peak_regions):
         tag = f"C{pi+1}" if len(peak_regions) > 1 else ""
-        print(f"\n── Peak {pi+1}/{len(peak_regions)} ──")
-
-        si_peak = stokes_i[:, start:end]
-        tm_peak = time_ms[start:end]
-
-        #plt.imshow(si_peak, aspect="auto", extent=(tm_peak[0], tm_peak[-1], freq_mhz[0], freq_mhz[-1]), origin="lower", cmap="plasma")
-        #plt.xlabel("Time (ms)")
-        #plt.ylabel("Frequency (MHz)")
-        #plt.show()
-
-        dm_values = _build_dm_grid(freq_mhz, tm_peak, args.dm_min, args.dm_max,
-                                   ref_freq=args.ref_freq,
-                                   dm_step=args.dm_step, ndm=args.ndm)
-        print(f"  DM grid: {len(dm_values)} points, "
-              f"[{dm_values[0]:.2f}, {dm_values[-1]:.2f}]")
+        print(f"\n── Peak {pi+1}/{len(peak_regions)} ── "
+              f"(input DM {args.input_dm})")
 
         print("  Dedispersing over DM grid (once)...")
-        output_size = dedisperser.max_output_size_for_dm_range(
-            si_peak, (args.dm_min, args.dm_max))
-        i_dm_t = np.zeros((len(dm_values), output_size), dtype=float)
-        for idx, dm in enumerate(dm_values):
-            dedisp = dedisperser.dedisperse(
-                si_peak, dm, output_size=output_size, mode=args.dedisp_mode)
-            i_dm_t[idx] = np.nansum(dedisp, axis=0)
-        print(f"  I(DM,t) shape: {i_dm_t.shape}")
-        
-        plt.imshow(i_dm_t, aspect="auto", extent=(0, i_dm_t.shape[1]*dt, dm_values[-1], dm_values[0]))
-        plt.xlabel("Time (ms)")
-        plt.ylabel("DM (pc cm^-3)")
-        plt.title("Dedispersed Intensity")
-        plt.show()
-
-        # Pre-compute DCT once (avoids redundant DCTs in the O/kc sweep)
-        print("  Computing DCT (once for all O/kc)...")
-        CI_data = dct(i_dm_t, norm="ortho")
-        print(f"  DCT shape: {CI_data.shape}")
-
+        dm_values, CI_data = _prepare_component(
+            args, stokes_i, freq_mhz, time_ms, (start, end), dedisperser)
         plot_dct_spectrum(CI_data, output_dir, args.ext, tag=tag)
 
         total = len(orders) * len(kc_values)
@@ -657,16 +1103,15 @@ def run_real_sweep(args, output_dir: Path):
         for order in orders:
             for kc in kc_values:
                 done += 1
-                t0 = _time.time()
                 try:
                     dm_best, formal_unc, unc_minus, unc_plus = _eval_one(
-                        i_dm_t, dm_values, order, kc, CI_data=CI_data)
+                        dm_values, order, kc, CI_data)
                 except Exception as e:
-                    sys.stderr.write(f"\r  [{done}/{total}] O={order:2d} kc={kc:3d}  FAILED: {e}   \n")
+                    sys.stderr.write(f"\r  [{done}/{total}] O={order:2d} "
+                                     f"kc={kc:3d}  FAILED: {e}   \n")
                     sys.stderr.flush()
                     continue
 
-                elapsed = _time.time() - t0
                 row = {
                     "order": order,
                     "kc": kc,
@@ -693,8 +1138,7 @@ def run_real_sweep(args, output_dir: Path):
         print(f"  Running default SHRINE (O=3, auto-kc) for reference...")
         try:
             auto_kc = int(get_kc(CI_data))
-            dm_ref, unc_ref, _, _ = _eval_one(i_dm_t, dm_values, 3, auto_kc,
-                                              CI_data=CI_data)
+            dm_ref, unc_ref, _, _ = _eval_one(dm_values, 3, auto_kc, CI_data)
             ref_kc = auto_kc
             print(f"  Default SHRINE: DM={dm_ref:.6f}  unc={unc_ref:.6f}  "
                   f"auto-kc={ref_kc}")
@@ -732,11 +1176,8 @@ def plot_dct_spectrum(CI_data, output_dir: Path, ext: str, tag=""):
     if kc is not None:
         plt.axvline(x=kc)
     plt.grid(color='k', linestyle='--', linewidth=0.5)
-    prefix = f"DCT_v_k_index_{tag}" if tag else "DCT_v_k_index"
-    path = output_dir / f"{prefix}.{ext}"
-    plt.savefig(path)
-    plt.clf()
-    print(f"Saved {path}")
+    _save_fig(output_dir, f"DCT_v_k_index_{tag}" if tag else "DCT_v_k_index",
+              ext)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -761,322 +1202,322 @@ def plot_tophat_comparison(output_dir: Path, ext: str):
     ax.set_title(f"Butterworth low-pass filter responses (kc={kc})")
     ax.legend()
     ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_dir / f"tophat_comparison.{ext}", dpi=150)
-    plt.close()
-    print(f"Saved top-hat comparison to {output_dir / f'tophat_comparison.{ext}'}")
+    _save_fig(output_dir, "tophat_comparison", ext)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Summary plots
+# Real-data summary plots
 # ──────────────────────────────────────────────────────────────────────
 
-def plot_sweep_heatmaps(rows, output_dir: Path, ext: str, mode: str, input_dm=0.0):
+def plot_real_heatmaps(rows, output_dir: Path, ext: str, input_dm=0.0):
+    """Per-component DM_SHRINE (centred on the input DM) and formal
+    uncertainty heatmaps, with the default-SHRINE reference marked."""
     if not rows:
         print("No results to plot.")
         return
 
-    orders = sorted(set(r["order"] for r in rows))
-    kcs = sorted(set(r["kc"] for r in rows))
+    peak_labels = sorted(set(r.get("peak", "") for r in rows))
+    n_peaks = len(peak_labels)
+    if n_peaks == 0:
+        return
 
-    def _grid(key):
-        g = np.full((len(orders), len(kcs)), np.nan)
-        for r in rows:
-            if key in r and r[key] is not None:
-                oi = orders.index(r["order"])
-                ki = kcs.index(r["kc"])
-                g[oi, ki] = r[key]
-        return g
+    # Collect per-peak grids first so colour limits can be shared across
+    # components (identical saturation keeps colours directly comparable)
+    peak_data = []
+    for plabel in peak_labels:
+        prow = [r for r in rows if r.get("peak", "") == plabel]
+        if not prow:
+            peak_data.append(None)
+            continue
+        dm_grid, porders, pkcs = rows_to_grid(prow, "recovered_dm")
+        unc_grid, _, _ = rows_to_grid(prow, "formal_unc", porders, pkcs)
+        ref_rows = [r for r in prow if r.get("_ref_dm") is not None]
+        peak_data.append({
+            "orders": porders, "kcs": pkcs,
+            "dm_grid": dm_grid, "unc_grid": unc_grid,
+            "ref": ref_rows[0] if ref_rows else None, "label": plabel,
+        })
 
-    bias_grid = _grid("bias")
-    scatter_grid = _grid("scatter")
-    unc_grid = _grid("mean_formal_unc")
-    if not np.any(np.isfinite(unc_grid)):
-        unc_grid = _grid("formal_unc")
-    coverage_grid = _grid("coverage")
+    # Shared DM scale centred on the input DM: white always marks exact
+    # recovery of the prep-corrected value
+    dm_centre = input_dm
+    halves = [float(np.max(np.abs(d["dm_grid"][np.isfinite(d["dm_grid"])]
+                                  - dm_centre)))
+              for d in peak_data
+              if d is not None and np.any(np.isfinite(d["dm_grid"]))]
+    dm_half = max(halves) * 1.05 if halves else 1.0
+    if not dm_half > 0:
+        dm_half = 1.0
+    dm_vmin, dm_vmax = dm_centre - dm_half, dm_centre + dm_half
 
-    has_bias = np.any(np.isfinite(bias_grid))
-    has_scatter = np.any(np.isfinite(scatter_grid))
-    has_coverage = np.any(np.isfinite(coverage_grid))
+    fig, axes = plt.subplots(n_peaks, 2,
+                             figsize=(13, 5 * n_peaks), squeeze=False)
+    fig.subplots_adjust(hspace=0.35, wspace=0.25)
 
-    if mode == "synthetic":
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        axes = axes.ravel()
+    for row_idx, pd in enumerate(peak_data):
+        if pd is None:
+            for col in range(2):
+                axes[row_idx, col].set_visible(False)
+            continue
 
-        def _imshow(ax, data, cmap, label, title, **kw):
-            if np.any(np.isfinite(data)):
-                im = ax.imshow(data, aspect="auto", origin="lower", cmap=cmap,
-                               extent=[kcs[0], kcs[-1], orders[0], orders[-1]],
-                               **kw)
-                plt.colorbar(im, ax=ax, label=label)
-            ax.set_xlabel("kc")
-            ax.set_ylabel("Order O")
-            ax.set_title(title)
+        porders, pkcs = pd["orders"], pd["kcs"]
+        dm_grid, unc_grid = pd["dm_grid"], pd["unc_grid"]
+        label = pd["label"]
+        tag = f" — {label}" if label else ""
 
-        if has_bias:
-            vabs = max(np.nanpercentile(np.abs(bias_grid[np.isfinite(bias_grid)]), 95), 1e-6)
-            _imshow(axes[0], bias_grid, "RdBu_r",
-                    r"$\langle DM - DM_{\rm true}\rangle$ [pc cm$^{-3}$]",
-                    "Bias", vmin=-vabs, vmax=vabs)
-        else:
-            axes[0].set_title("Bias (no data)")
+        ufin = unc_grid[np.isfinite(unc_grid)]
+        unc_vmax = float(np.max(ufin)) * 1.05 if ufin.size else 1.0
+        unc_vmax = unc_vmax if unc_vmax > 0 else 1.0
 
-        _imshow(axes[1], scatter_grid, "viridis",
-                r"Scatter $\sigma(DM)$ [pc cm$^{-3}$]",
-                "Scatter (std of recovered DM)")
+        kc_step = pkcs[1] - pkcs[0] if len(pkcs) > 1 else 1
+        img_ext = [pkcs[0] - 0.5 * kc_step, pkcs[-1] + 0.5 * kc_step,
+                   porders[0] - 0.5, porders[-1] + 0.5]
 
-        _imshow(axes[2], unc_grid, "viridis",
-                r"Mean $(\Delta_{\rm DM}^{+}{+}|\Delta_{\rm DM}^{-}|)/2$ [pc cm$^{-3}$]",
-                "Mean DM range half-width")
+        # DM_SHRINE panel
+        ax_dm = axes[row_idx, 0]
+        draw_heatmap(
+            ax_dm, dm_grid, pkcs, porders, "PuOr", dm_vmin, dm_vmax,
+            clabel=r"$\mathrm{DM}_{\rm SHRINE}$ [pc cm$^{-3}$]",
+            title=rf"$\mathrm{{DM}}_{{\rm SHRINE}}{tag} "
+                  rf"(centred on input $\pm{dm_half:.3g}$)")
+        annotate_cells(ax_dm, pkcs, porders, dm_grid - dm_centre,
+                       lambda v: f"{v:+.3g}", dm_vmin, dm_vmax, "centred")
 
-        if has_coverage:
-            _imshow(axes[3], coverage_grid, "RdYlGn",
-                    "Coverage fraction",
-                    r"Coverage (within range half-width)", vmin=0, vmax=1)
-        else:
-            axes[3].set_title("Coverage (no data)")
+        # Formal-uncertainty panel
+        ax_unc = axes[row_idx, 1]
+        draw_heatmap(
+            ax_unc, unc_grid, pkcs, porders, "Reds", 0.0, unc_vmax,
+            clabel=r"$(\Delta_{\rm DM}^{+}{+}|\Delta_{\rm DM}^{-}|)/2$ "
+                   r"[pc cm$^{-3}$]",
+            title=rf"DM range half-width{tag} (max {unc_vmax:.3g})")
+        annotate_cells(ax_unc, pkcs, porders, unc_grid,
+                       lambda v: f"{v:.3g}", 0.0, unc_vmax, "seq")
 
-        plt.suptitle("SHRINE filter sweep — synthetic", y=1.01)
-        plt.tight_layout()
-        plt.savefig(output_dir / f"sweep_heatmaps.{ext}", dpi=150, bbox_inches="tight")
-        plt.close()
-        print(f"Saved {output_dir / f'sweep_heatmaps.{ext}'}")
+        if row_idx == n_peaks - 1:
+            for ax in (ax_dm, ax_unc):
+                ax.set_xlabel("kc")
 
-        # Scatter vs range half-width
-        if has_scatter and np.any(np.isfinite(unc_grid)):
-            fig, axes2 = plt.subplots(1, 2, figsize=(12, 5))
+        # Overlay default-SHRINE reference (star + crosshair + info box)
+        ref = pd["ref"]
+        if ref is None:
+            continue
+        ref_kc = ref["_ref_kc"]
+        ref_dm = ref["_ref_dm"]
+        ref_unc = ref["_ref_unc"]
 
-            ax = axes2[0]
-            for oi, order in enumerate(orders):
-                s, u = scatter_grid[oi], unc_grid[oi]
-                v = np.isfinite(s) & np.isfinite(u)
-                if np.any(v):
-                    ax.plot(u[v], s[v], "o-", label=f"O={order}", markersize=3)
-            lims = [0, max(ax.get_xlim()[1], ax.get_ylim()[1]) * 1.05]
-            ax.plot(lims, lims, "--", color="k", alpha=0.5)
-            ax.set_xlabel(r"Mean $(\Delta^{+}{+}|\Delta^{-}|)/2$ [pc cm$^{-3}$]")
-            ax.set_ylabel(r"Scatter $\sigma(DM)$")
-            ax.set_title("Scatter vs range half-width\n(diagonal = ideal)")
-            ax.legend(fontsize=7, ncol=2)
-            ax.grid(True, alpha=0.3)
+        star_kc = ref_kc
+        kc_in_grid = pkcs[0] <= ref_kc <= pkcs[-1]
+        if not kc_in_grid:
+            star_kc = pkcs[0] if ref_kc < pkcs[0] else pkcs[-1]
 
-            ax = axes2[1]
-            for ki, kc in enumerate(kcs):
-                s, u = scatter_grid[:, ki], unc_grid[:, ki]
-                v = np.isfinite(s) & np.isfinite(u)
-                if np.any(v):
-                    ax.plot(u[v], s[v], "o-", label=f"kc={kc}", markersize=3)
-            ax.plot(lims, lims, "--", color="k", alpha=0.5)
-            ax.set_xlabel(r"Mean $(\Delta^{+}{+}|\Delta^{-}|)/2$ [pc cm$^{-3}$]")
-            ax.set_ylabel(r"Scatter $\sigma(DM)$")
-            ax.set_title("Scatter vs range half-width\n(coloured by kc)")
-            ax.legend(fontsize=7, ncol=2)
-            ax.grid(True, alpha=0.3)
+        for ax in (ax_dm, ax_unc):
+            ax.axhline(y=3, color="red", linestyle="--", linewidth=0.8,
+                       alpha=0.5)
+            if kc_in_grid:
+                ax.axvline(x=ref_kc, color="red", linestyle="--",
+                           linewidth=0.8, alpha=0.5)
+            ax.plot(star_kc, 3, marker="*", markersize=20, color="red",
+                    markeredgecolor="white", markeredgewidth=1.0, zorder=10)
 
-            plt.tight_layout()
-            plt.savefig(output_dir / f"scatter_vs_formal.{ext}", dpi=150)
-            plt.close()
-            print(f"Saved {output_dir / f'scatter_vs_formal.{ext}'}")
+        kc_note = f"  (swept {pkcs[0]}-{pkcs[-1]})" if not kc_in_grid else ""
 
-    else:
-        # Real mode — single figure, one row per peak
-        peak_labels = sorted(set(r.get("peak", "") for r in rows))
-        n_peaks = len(peak_labels)
-        if n_peaks == 0:
-            return
+        # Pick annotation offset so the box stays inside the axes
+        kc_frac = (star_kc - pkcs[0]) / (pkcs[-1] - pkcs[0]) \
+            if len(pkcs) > 1 else 0.5
+        o_frac = (3 - porders[0]) / (porders[-1] - porders[0]) \
+            if len(porders) > 1 else 0.5
+        x_off = -50 if kc_frac > 0.6 else 20
+        y_off = -50 if o_frac > 0.6 else 20
 
-        # Collect per-peak data first so we can use shared colour limits
-        peak_data = []
-        for plabel in peak_labels:
-            prow = [r for r in rows if r.get("peak", "") == plabel]
-            if not prow:
-                peak_data.append(None)
-                continue
-            porders = sorted(set(r["order"] for r in prow))
-            pkcs = sorted(set(r["kc"] for r in prow))
+        ax_dm.annotate(
+            f"O=3, kc={ref_kc}\nDM={ref_dm:.4f}\n"
+            + r"$\sigma=$" + f"{ref_unc:.4f}",
+            xy=(star_kc, 3), xycoords="data",
+            xytext=(x_off, y_off), textcoords="offset points",
+            fontsize=8, color="red", fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color="red", lw=1.2),
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="red",
+                      alpha=0.85),
+        )
+        print(f"  Reference {label or 'single'}: O=3, kc={ref_kc}, "
+              f"DM={ref_dm:.6f}, unc={ref_unc:.6f}{kc_note}")
 
-            def _pgrid(key):
-                g = np.full((len(porders), len(pkcs)), np.nan)
-                for r in prow:
-                    if key in r and r[key] is not None and r["order"] in porders and r["kc"] in pkcs:
-                        oi = porders.index(r["order"])
-                        ki = pkcs.index(r["kc"])
-                        g[oi, ki] = r[key]
-                return g
+    plt.savefig(output_dir / f"real_sweep.{ext}", dpi=150)
+    plt.close()
+    print(f"Saved {output_dir / f'real_sweep.{ext}'}")
 
-            dm_grid = _pgrid("recovered_dm")
-            unc_grid = _pgrid("formal_unc")
-            ref_rows = [r for r in prow if "_ref_dm" in r and r["_ref_dm"] is not None]
-            ref = ref_rows[0] if ref_rows else None
-            peak_data.append({
-                "porders": porders, "pkcs": pkcs,
-                "dm_grid": dm_grid, "unc_grid": unc_grid,
-                "ref": ref, "label": plabel,
-            })
 
-        # Shared colour limits centred on the input DM: white always marks
-        # exact recovery, and identical saturation across components keeps
-        # colours directly comparable
-        dm_centre = input_dm
-        halves = [float(np.max(np.abs(d["dm_grid"][np.isfinite(d["dm_grid"])] - dm_centre)))
-                  for d in peak_data
-                  if d is not None and np.any(np.isfinite(d["dm_grid"]))]
-        dm_half = max(halves) * 1.05 if halves else 1.0
-        if not dm_half > 0:
-            dm_half = 1.0
-        dm_vmin, dm_vmax = dm_centre - dm_half, dm_centre + dm_half
+# ──────────────────────────────────────────────────────────────────────
+# Real-data differential DM (DM2 - DM1)
+# ──────────────────────────────────────────────────────────────────────
 
-        pulls = []
-        for d in peak_data:
-            if d is None:
-                continue
-            with np.errstate(divide="ignore", invalid="ignore"):
-                d["pull_grid"] = (d["dm_grid"] - dm_centre) / d["unc_grid"]
-            pfin = d["pull_grid"][np.isfinite(d["pull_grid"])]
-            if pfin.size:
-                pulls.append(pfin)
-            ufin = d["unc_grid"][np.isfinite(d["unc_grid"])]
-            uvmax = float(np.max(ufin)) * 1.05 if ufin.size else 1.0
-            d["unc_vmax"] = uvmax if uvmax > 0 else 1.0
+def compute_differential_rows(all_rows):
+    """Combine per-component sweep rows into differential-DM rows.
 
-        # Bias-significance limits: auto-scaled from the data but identical
-        # across components so colours stay comparable
-        pulls = np.concatenate(pulls) if pulls else np.array([])
-        pull_lim = float(np.max(np.abs(pulls))) * 1.05 if pulls.size else 5.0
-        if not pull_lim > 0:
-            pull_lim = 5.0
+    Returns (diff_rows, ref_pair) where diff_rows have one entry per
+    (order, kc) with dm1/u1/dm2/u2, diff_dm = DM2-DM1,
+    sigma_diff = sqrt(u1^2+u2^2), and signed/absolute significances.
+    ref_pair is (row1, row2) default-SHRINE reference rows, or Nones.
+    """
+    labels = sorted(set(r.get("peak", "") for r in all_rows))
+    if len(labels) < 2:
+        return [], (None, None)
 
-        fig, axes = plt.subplots(n_peaks, 3,
-                                 figsize=(19, 5 * n_peaks), squeeze=False)
-        fig.subplots_adjust(hspace=0.35, wspace=0.25)
+    def _index(label):
+        out = {}
+        for r in all_rows:
+            if r.get("peak", "") == label:
+                out[(r["order"], r["kc"])] = r
+        return out
 
-        for row_idx, pd in enumerate(peak_data):
-            if pd is None:
-                for col in range(3):
-                    axes[row_idx, col].set_visible(False)
-                continue
+    idx1, idx2 = _index(labels[0]), _index(labels[1])
+    common = sorted(set(idx1) & set(idx2))
 
-            porders, pkcs = pd["porders"], pd["pkcs"]
-            dm_grid, unc_grid = pd["dm_grid"], pd["unc_grid"]
-            label = pd["label"]
-            tag = f" — {label}" if label else ""
-            unc_vmax = pd["unc_vmax"]
+    diff_rows = []
+    for key in common:
+        r1, r2 = idx1[key], idx2[key]
+        dm1, u1 = r1["recovered_dm"], r1["formal_unc"]
+        dm2, u2 = r2["recovered_dm"], r2["formal_unc"]
+        sigma = float(np.hypot(u1, u2))
+        ddm = float(dm2 - dm1)
+        sig = ddm / sigma if sigma > 0 else np.nan
+        diff_rows.append({
+            "order": key[0], "kc": key[1],
+            "dm1": dm1, "unc1": u1, "dm2": dm2, "unc2": u2,
+            "diff_dm": ddm, "sigma_diff": sigma,
+            "sig_signed": sig, "sig_abs": abs(sig),
+        })
 
-            def _annotate(ax, values, fmt, vmin, vmax, white_at_extremes):
-                """Overlay per-cell values when the grid is small enough."""
-                if values.size > 300 or max(values.shape) > 40:
-                    return
-                for oi in range(values.shape[0]):
-                    for ki in range(values.shape[1]):
-                        v = values[oi, ki]
-                        if not np.isfinite(v):
-                            continue
-                        frac = (float(v) - vmin) / (vmax - vmin)
-                        if white_at_extremes:
-                            colour = "w" if abs(frac - 0.5) > 0.32 else "k"
-                        else:
-                            colour = "w" if frac > 0.62 else "k"
-                        ax.text(pkcs[ki], porders[oi], fmt(v),
-                                ha="center", va="center", fontsize=4.5,
-                                color=colour)
+    def _ref(label_idx):
+        for r in all_rows:
+            if (r.get("peak", "") == labels[label_idx]
+                    and r.get("_ref_dm") is not None):
+                return r
+        return None
 
-            kc_step = pkcs[1] - pkcs[0] if len(pkcs) > 1 else 1
-            img_ext = [pkcs[0] - 0.5 * kc_step, pkcs[-1] + 0.5 * kc_step,
-                       porders[0] - 0.5, porders[-1] + 0.5]
+    return diff_rows, (_ref(0), _ref(1))
 
-            # DM_SHRINE (colour scale centred on the input DM, shared limits)
-            ax_dm = axes[row_idx, 0]
-            if np.any(np.isfinite(dm_grid)):
-                im_dm = ax_dm.imshow(dm_grid, aspect="auto", origin="lower",
-                                     cmap="PuOr",
-                                     vmin=dm_vmin, vmax=dm_vmax,
-                                     extent=img_ext)
-                plt.colorbar(im_dm, ax=ax_dm,
-                             label=r"$\mathrm{DM}_{\rm SHRINE}$ [pc cm$^{-3}$]")
-                _annotate(ax_dm, dm_grid - dm_centre,
-                          lambda v: f"{v:+.3g}",
-                          dm_vmin, dm_vmax, True)
-            ax_dm.set_ylabel("Order O")
-            ax_dm.set_title(rf"$\mathrm{{DM}}_{{\rm SHRINE}}${tag} "
-                            rf"(centred on input $\pm{dm_half:.3g}$)")
 
-            # Significance of deviation from input (bias pull)
-            ax_pull = axes[row_idx, 1]
-            pull_grid = pd["pull_grid"]
-            if np.any(np.isfinite(pull_grid)):
-                im_pull = ax_pull.imshow(pull_grid, aspect="auto",
-                                         origin="lower", cmap="PuOr",
-                                         vmin=-pull_lim, vmax=pull_lim,
-                                         extent=img_ext)
-                plt.colorbar(im_pull, ax=ax_pull,
-                             label=r"$(DM-DM_{\rm in})/\sigma$")
-                _annotate(ax_pull, pull_grid,
-                          lambda v: f"{v:+.2f}", -pull_lim, pull_lim, True)
-            ax_pull.set_ylabel("Order O")
-            ax_pull.set_title(rf"Significance of bias{tag} "
-                              rf"(shared $\pm{pull_lim:.3g}\sigma$)")
+def plot_real_differential(diff_rows, refs, output_dir: Path, ext: str):
+    """Main real-data result figure: component stability, differential DM,
+    its significance, and the formal differential uncertainty."""
+    if not diff_rows:
+        print("Differential plot skipped (needs >= 2 peaks).")
+        return
 
-            # DM range half-width from relative uncertainty
-            ax_unc = axes[row_idx, 2]
-            if np.any(np.isfinite(unc_grid)):
-                im_unc = ax_unc.imshow(unc_grid, aspect="auto", origin="lower",
-                                       cmap="Reds", vmin=0, vmax=unc_vmax,
-                                       extent=img_ext)
-                plt.colorbar(im_unc, ax=ax_unc,
-                             label=r"$(\Delta_{\rm DM}^{+}{+}|\Delta_{\rm DM}^{-}|)/2$ "
-                                   r"[pc cm$^{-3}$]")
-                _annotate(ax_unc, unc_grid, lambda v: f"{v:.3g}",
-                          0.0, unc_vmax, False)
-            ax_unc.set_title(rf"DM range half-width{tag} "
-                             rf"(max {unc_vmax:.3g})")
+    dm1_g, orders, kcs = rows_to_grid(diff_rows, "dm1")
+    dm2_g, _, _ = rows_to_grid(diff_rows, "dm2", orders, kcs)
+    ddm_g, _, _ = rows_to_grid(diff_rows, "diff_dm", orders, kcs)
+    sig_g, _, _ = rows_to_grid(diff_rows, "sigma_diff", orders, kcs)
+    s_g, _, _ = rows_to_grid(diff_rows, "sig_signed", orders, kcs)
+    absg_g, _, _ = rows_to_grid(diff_rows, "sig_abs", orders, kcs)
 
-            # x-label only on bottom row
-            if row_idx == n_peaks - 1:
-                for ax in (ax_dm, ax_pull, ax_unc):
-                    ax.set_xlabel("kc")
+    kc_step = kcs[1] - kcs[0] if len(kcs) > 1 else 1
+    img_ext = [kcs[0] - 0.5 * kc_step, kcs[-1] + 0.5 * kc_step,
+               orders[0] - 0.5, orders[-1] + 0.5]
 
-            # Overlay default SHRINE reference
-            ref = pd["ref"]
-            if ref is not None:
-                ref_kc = ref["_ref_kc"]
-                ref_dm = ref["_ref_dm"]
-                ref_unc = ref["_ref_unc"]
+    def _lim(key_grid, default):
+        fin = key_grid[np.isfinite(key_grid)]
+        return float(np.max(np.abs(fin))) * 1.05 if fin.size else default
 
-                star_kc = ref_kc
-                kc_in_grid = pkcs[0] <= ref_kc <= pkcs[-1]
-                if not kc_in_grid:
-                    star_kc = pkcs[0] if ref_kc < pkcs[0] else pkcs[-1]
+    # Shared stability scale across the two components: each panel centred
+    # on that component's median, identical half-width
+    halves = []
+    for g in (dm1_g, dm2_g):
+        fin = g[np.isfinite(g)]
+        if fin.size:
+            halves.append(float(np.max(np.abs(fin - np.median(fin)))))
+    stab_half = (max(halves) * 1.05) if halves else 1.0
+    med1 = float(np.median(dm1_g[np.isfinite(dm1_g)]))
+    med2 = float(np.median(dm2_g[np.isfinite(dm2_g)]))
 
-                for ax in (ax_dm, ax_pull, ax_unc):
-                    ax.axhline(y=3, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
-                    if kc_in_grid:
-                        ax.axvline(x=ref_kc, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
-                    ax.plot(star_kc, 3, marker="*", markersize=20, color="red",
-                            markeredgecolor="white", markeredgewidth=1.0, zorder=10)
+    dd_abs = _lim(ddm_g, 1.0)
+    s_abs = _lim(s_g, 5.0)
+    sg_max = _lim(sig_g, 1.0)
+    asg_max = _lim(absg_g, 5.0)
 
-                kc_note = f"  (swept {pkcs[0]}-{pkcs[-1]})" if not kc_in_grid else ""
+    fig, axes = plt.subplots(2, 3, figsize=(19, 10), squeeze=False)
+    fig.subplots_adjust(hspace=0.3, wspace=0.25)
 
-                # Pick annotation offset so the box stays inside the axes
-                kc_frac = (star_kc - pkcs[0]) / (pkcs[-1] - pkcs[0]) if len(pkcs) > 1 else 0.5
-                o_frac = (3 - porders[0]) / (porders[-1] - porders[0]) if len(porders) > 1 else 0.5
-                x_off = -50 if kc_frac > 0.6 else 20
-                y_off = -50 if o_frac > 0.6 else 20
+    panels = [
+        (axes[0, 0], dm1_g, "PuOr", med1 - stab_half, med1 + stab_half,
+         rf"$\mathrm{{DM}}_1$ (centred on median {med1:.4g})",
+         r"$\mathrm{DM}$ [pc cm$^{-3}$]", lambda v: f"{v:+.3g}", "centred"),
+        (axes[0, 1], dm2_g, "PuOr", med2 - stab_half, med2 + stab_half,
+         rf"$\mathrm{{DM}}_2$ (centred on median {med2:.4g})",
+         r"$\mathrm{DM}$ [pc cm$^{-3}$]", lambda v: f"{v:+.3g}", "centred"),
+        (axes[0, 2], ddm_g, "PuOr", -dd_abs, dd_abs,
+         r"$\Delta\mathrm{DM}_{21}=\mathrm{DM}_2-\mathrm{DM}_1$",
+         r"$\Delta\mathrm{DM}_{21}$ [pc cm$^{-3}$]", lambda v: f"{v:+.3g}",
+         "extremes"),
+        (axes[1, 0], s_g, "PuOr", -s_abs, s_abs,
+         r"Significance $S=\Delta\mathrm{DM}_{21}/\sigma_{\Delta}$",
+         r"$S=(\mathrm{DM}_2-\mathrm{DM}_1)/\sigma_\Delta$",
+         lambda v: f"{v:+.2f}", "centred"),
+        (axes[1, 1], sig_g, "Reds", 0.0, sg_max,
+         r"Formal differential uncertainty $\sigma_{\Delta}"
+         r"=\sqrt{\sigma_1^2+\sigma_2^2}$",
+         r"$\sigma_{\Delta}$ [pc cm$^{-3}$]", lambda v: f"{v:.3g}", "seq"),
+        (axes[1, 2], absg_g, "viridis", 0.0, asg_max,
+         r"Absolute significance $|S|$",
+         r"$|S|$", lambda v: f"{v:.2f}", "seq"),
+    ]
 
-                ax_dm.annotate(
-                    f"O=3, kc={ref_kc}\nDM={ref_dm:.4f}\n"
-                    + r"$\sigma=$" + f"{ref_unc:.4f}",
-                    xy=(star_kc, 3), xycoords="data",
-                    xytext=(x_off, y_off), textcoords="offset points",
-                    fontsize=8, color="red", fontweight="bold",
-                    arrowprops=dict(arrowstyle="->", color="red", lw=1.2),
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="red", alpha=0.85),
-                )
-                print(f"  Reference {label or 'single'}: O=3, kc={ref_kc}, "
-                      f"DM={ref_dm:.6f}, unc={ref_unc:.6f}{kc_note}")
+    for ax, grid, cmap, vmin, vmax, title, clabel, fmt, amode in panels:
+        if np.any(np.isfinite(grid)):
+            im = ax.imshow(grid, aspect="auto", origin="lower", cmap=cmap,
+                           vmin=vmin, vmax=vmax, extent=img_ext,
+                           interpolation="nearest")
+            plt.colorbar(im, ax=ax, label=clabel)
+            annotate_cells(ax, kcs, orders, grid, fmt, vmin, vmax, amode)
+        if "Significance" in title or "|S|" in title:
+            ax.axhline(y=3, color="k", linestyle="--", linewidth=0.7,
+                       alpha=0.5)
+        ax.set_xlabel("kc")
+        ax.set_ylabel("Order O")
+        ax.set_title(title)
 
-        plt.savefig(output_dir / f"real_sweep.{ext}", dpi=150)
-        plt.close()
-        print(f"Saved {output_dir / f'real_sweep.{ext}'}")
+    # Reference summary box on the main-result panel
+    r1, r2 = refs
+    if r1 is not None and r2 is not None:
+        d_ref = r2["_ref_dm"] - r1["_ref_dm"]
+        s_ref = float(np.hypot(r1["_ref_unc"], r2["_ref_unc"]))
+        axes[0, 2].annotate(
+            f"default SHRINE\n"
+            rf"$\Delta\mathrm{{DM}}_{{21}}$={d_ref:.4f}"
+            rf" $\pm$ {s_ref:.4f}" "\n"
+            rf"$S={d_ref/s_ref:+.2f}\sigma$",
+            xy=(0.03, 0.96), xycoords="axes fraction",
+            va="top", fontsize=8, color="red",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="red",
+                      alpha=0.85),
+        )
+
+    plt.savefig(output_dir / f"real_differential.{ext}", dpi=150,
+                bbox_inches="tight")
+    plt.close()
+    print(f"Saved {output_dir / f'real_differential.{ext}'}")
+
+    # Reference summary box on the main-result panel
+    r1, r2 = refs
+    if r1 is not None and r2 is not None:
+        d_ref = r2["_ref_dm"] - r1["_ref_dm"]
+        s_ref = float(np.hypot(r1["_ref_unc"], r2["_ref_unc"]))
+        axes[0, 2].annotate(
+            f"default SHRINE\n"
+            rf"$\Delta\mathrm{{DM}}_{{21}}$={d_ref:.4f}"
+            rf" $\pm$ {s_ref:.4f}" "\n"
+            rf"$S={d_ref/s_ref:+.2f}\sigma$",
+            xy=(0.03, 0.96), xycoords="axes fraction",
+            va="top", fontsize=8, color="red",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="red",
+                      alpha=0.85),
+        )
+
+    plt.savefig(output_dir / f"real_differential.{ext}", dpi=150,
+                bbox_inches="tight")
+    plt.close()
+    print(f"Saved {output_dir / f'real_differential.{ext}'}")
 
 
 def save_csv(rows, output_dir: Path, filename: str):
@@ -1101,23 +1542,25 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
-    synth_rows, real_rows = [], []
-
     if args.mode in ("synthetic", "both"):
-        synth_rows = run_synthetic_sweep(args, output_dir)
-        save_csv(synth_rows, output_dir, "synthetic_sweep.csv")
+        synth_rows, synth_meta = run_synthetic_differential(args, output_dir)
+        save_csv(synth_rows, output_dir, "synthetic_differential.csv")
+        if synth_rows:
+            plot_sim_recovery(synth_rows, synth_meta, output_dir, args.ext)
+            plot_sim_calibration(synth_rows, synth_meta, output_dir, args.ext)
+            plot_sim_sensitivity(synth_rows, synth_meta, output_dir, args.ext)
 
     if args.mode in ("real", "both"):
         real_rows = run_real_sweep(args, output_dir)
         save_csv(real_rows, output_dir, "real_sweep.csv")
 
-    if args.mode in ("synthetic", "both") and synth_rows:
-        plot_sweep_heatmaps(synth_rows, output_dir, args.ext, "synthetic",
-                            input_dm=args.injected_dm)
+        diff_rows, refs = compute_differential_rows(real_rows)
+        save_csv(diff_rows, output_dir, "real_differential.csv")
+        plot_real_differential(diff_rows, refs, output_dir, args.ext)
 
-    if args.mode in ("real", "both") and real_rows:
-        plot_sweep_heatmaps(real_rows, output_dir, args.ext, "real",
-                            input_dm=args.input_dm)
+        if real_rows:
+            plot_real_heatmaps(real_rows, output_dir, args.ext,
+                               input_dm=args.input_dm)
 
     if args.check_tophat:
         plot_tophat_comparison(output_dir, args.ext)

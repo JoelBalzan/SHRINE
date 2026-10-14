@@ -31,3 +31,11 @@ output/
 *.mprof
 .vscode/
 .idea/
+# LaTeX build artefacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+error_validation/out/
+Claude\ outputs/

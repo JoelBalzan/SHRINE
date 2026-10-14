@@ -1,0 +1,618 @@
+<title>SHRINE Error Explorer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Schibsted+Grotesk:wght@500;600;700&display=swap">
+<style>
+/* Layout: one drill-down column. Each numbered stage is one step of the actual pipeline
+   (ensemble -> realisation -> row -> weights -> slope -> sigma_DM), so the numbering is information. */
+:root {
+  --bg: #f2f4f6; --surface: #fbfcfd; --surface-2: #e9edf1; --ink: #0f1720; --ink-2: #46505b; --muted: #7b858f;
+  --rule: #d3d9df; --grid: #e3e7eb;
+  --accent: #2a78d6; --s23: #d6403e; --w: #6250d6; --deriv: #df5f2a; --sig: #12956a; --mc: #8a929a;
+  --heat-0: #fbfcfd; --heat-1: #86b6ef; --heat-2: #0d366b;
+  --font-display: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --r: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b0e12; --surface: #12161b; --surface-2: #1b2128; --ink: #e8ecf0; --ink-2: #b2bac3; --muted: #7a848e;
+    --rule: #2a3138; --grid: #1f252c;
+    --accent: #4a93ea; --s23: #e8605e; --w: #9085e9; --deriv: #ea7a44; --sig: #2fbf8a; --mc: #7c8590;
+    --heat-0: #0f1318; --heat-1: #2a6cc0; --heat-2: #dbe9fc;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0b0e12; --surface: #12161b; --surface-2: #1b2128; --ink: #e8ecf0; --ink-2: #b2bac3; --muted: #7a848e;
+  --rule: #2a3138; --grid: #1f252c;
+  --accent: #4a93ea; --s23: #e8605e; --w: #9085e9; --deriv: #ea7a44; --sig: #2fbf8a; --mc: #7c8590;
+  --heat-0: #0f1318; --heat-1: #2a6cc0; --heat-2: #dbe9fc;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--font-body); margin: 0; }
+.wrap { max-width: 1480px; margin: 0 auto; padding-inline: clamp(16px, 3vw, 32px); padding-block: 28px 64px; display: grid; gap: 22px;
+  grid-template-columns: minmax(0, 1fr) 252px; grid-template-areas: "head rail" "main rail"; align-items: start; }
+.mast { grid-area: head; }
+.main { grid-area: main; display: grid; gap: 22px; min-width: 0; }
+.rail { grid-area: rail; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 16px); max-height: calc(100vh - 32px); overflow-y: auto; }
+.rail-title { font: 600 15px/1.2 var(--font-display); }
+.rail { display: grid; gap: 12px; align-content: start; }
+.key { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--r); padding: 12px 14px; font-size: 12px; line-height: 1.35; color: var(--ink-2); }
+.key ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+.key summary { cursor: pointer; }
+.key li { display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 8px; align-items: start; }
+.key b { font-weight: 600; color: var(--ink); margin-right: 3px; }
+.kdot { width: 10px; height: 10px; border-radius: 3px; background: currentColor; margin-top: 4px; }
+.kdot.heat { background: linear-gradient(180deg, var(--heat-0), var(--heat-1), var(--heat-2)); box-shadow: inset 0 0 0 1px var(--rule); }
+.rail .controls { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 8px; padding: 12px 14px; }
+.rail .ctl select, .rail .ctl input { padding-block: 4px; }
+.rail .ctl select, .rail .ctl input, .rail .ctl input[type=number] { width: 100%; }
+.seedrow { display: flex; gap: 8px; align-items: end; }
+.seedrow .ctl { flex: 1; min-width: 0; }
+.rail .status { margin-left: 0; min-width: 0; padding-top: 10px; border-top: 1px solid var(--grid); }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: clamp(28px, 4vw, 40px); font-weight: 700; line-height: 1.1; }
+h2 { font-size: 21px; font-weight: 600; line-height: 1.2; }
+h3 { font-size: 15px; font-weight: 600; }
+p { margin: 0; }
+.mono, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.num { font-size: 0.92em; white-space: nowrap; }
+.muted { color: var(--muted); }
+.ink2 { color: var(--ink-2); }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* masthead */
+.mast { display: grid; gap: 14px; }
+.mast .eyebrow { font: 500 12px/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.mast .lede { max-width: 72ch; color: var(--ink-2); }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: end; padding: 12px 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: var(--r); }
+.ctl { display: grid; gap: 4px; }
+.ctl label { font: 500 11px/1 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.ctl select, .ctl input { font: 14px var(--font-mono); color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 6px; padding: 5px 8px; min-width: 0; }
+.ctl input[type=number] { width: 84px; }
+.btn { border: 1px solid var(--rule); background: var(--surface-2); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 14px; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.status { margin-left: auto; display: grid; gap: 5px; min-width: 200px; font: 12px var(--font-mono); color: var(--ink-2); }
+.bar { height: 4px; background: var(--surface-2); border-radius: 2px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+
+/* stages */
+.stage { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--r); padding: clamp(14px, 2.2vw, 24px); display: grid; gap: 16px; min-width: 0; }
+.stage-head { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; align-items: baseline; }
+.stage-no { font: 600 13px/1 var(--font-mono); color: var(--surface); background: var(--ink); border-radius: 50%; width: 26px; height: 26px; display: grid; place-items: center; transform: translateY(-2px); }
+.stage-head p { grid-column: 2; max-width: 78ch; color: var(--ink-2); }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 22px; }
+.split > * { min-width: 0; }
+figure { margin: 0; display: grid; gap: 6px; min-width: 0; }
+figcaption { font: 500 12px/1.3 var(--font-mono); color: var(--ink-2); letter-spacing: 0.02em; }
+canvas { display: block; width: 100%; touch-action: manipulation; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 12.5px; color: var(--ink-2); }
+.legend .grp { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; padding: 1px 10px 1px 8px; border-left: 2px solid currentColor;
+  background: color-mix(in srgb, currentColor 6%, transparent); border-radius: 0 6px 6px 0; }
+.legend .lbl { font-weight: 600; white-space: nowrap; }
+.legend .it { display: inline-block; white-space: nowrap; }
+.legend .sw, .legend .it > b { margin-right: 6px; vertical-align: middle; }
+sub, sup { line-height: 0; }
+.sw { width: 16px; height: 0; border-top: 2px solid currentColor; display: inline-block; }
+.sw.dash { border-top-style: dashed; }
+.sw.dot { border-top-style: dotted; }
+.sw.box { height: 10px; border: 0; opacity: .35; background: currentColor; }
+.sw.box.solid { opacity: .85; }
+.sw.dotf { width: 7px; height: 7px; border: 0; border-radius: 50%; background: currentColor; }
+.sw.doth { width: 7px; height: 7px; border: 1.3px solid currentColor; border-radius: 50%; background: transparent; }
+.sw.hollow { width: 12px; height: 10px; border: 1.5px solid currentColor; background: transparent; }
+.c-ink { color: var(--ink); } .c-new { color: var(--accent); } .c-s23 { color: var(--s23); } .c-w { color: var(--w); }
+.c-deriv { color: var(--deriv); } .c-sig { color: var(--sig); } .c-mc { color: var(--mc); } .c-muted { color: var(--muted); }
+.hint { font-size: 13px; color: var(--muted); }
+.stack { display: grid; gap: 10px; }
+
+/* deck */
+.deck { position: relative; width: 100%; }
+.card { position: absolute; left: 0; top: 0; padding: 0; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); overflow: hidden; cursor: pointer;
+  box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 6px 18px -10px rgba(0,0,0,.35); transition: transform .45s cubic-bezier(.2,.8,.2,1), border-color .15s; text-align: left; }
+.card canvas { position: absolute; left: 0; right: 0; bottom: 0; width: 100%; }
+.card .tag { position: absolute; left: 0; right: 0; top: 0; height: 22px; padding: 0 9px; display: flex; justify-content: space-between; align-items: center; font: 11px/1 var(--font-mono); color: var(--ink-2); background: var(--surface-2); border-bottom: 1px solid var(--rule); }
+.card .tag b { font-weight: 500; color: var(--ink); }
+.card:hover, .card:focus-visible { border-color: var(--accent); }
+.card.sel { border-color: var(--ink); border-width: 1.5px; }
+.card.pending .tag { color: var(--muted); }
+@media (prefers-reduced-motion: reduce) { .card, .bar i { transition: none; } }
+
+/* budget */
+.budget { width: 100%; border-collapse: collapse; font-size: 14px; }
+.budget th, .budget td { padding: 7px 10px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
+.budget th:first-child, .budget td:first-child { text-align: left; white-space: normal; }
+.budget thead th { font: 500 11px/1.2 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--rule); }
+.budget td { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.budget td:first-child { font-family: var(--font-body); }
+.chip { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 99px; font-size: 12px; font-weight: 500; }
+.chip.good { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.chip.bad { color: var(--s23); background: color-mix(in srgb, var(--s23) 14%, transparent); }
+.tablewrap { overflow-x: auto; }
+.decomp { font-size: 13.5px; color: var(--ink-2); }
+
+/* realisation panel */
+.rgrid { display: grid; grid-template-columns: minmax(0, 2.1fr) minmax(0, 1fr); gap: 4px 18px; }
+.rgrid > * { min-width: 0; }
+
+/* dynspec */
+.dgrid { display: grid; grid-template-columns: minmax(0, 2.1fr) minmax(220px, 1fr); gap: 18px; }
+.dgrid > * { min-width: 0; }
+.side { display: grid; gap: 12px; align-content: start; font-size: 14px; }
+.readout { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13px; }
+.readout dt { color: var(--muted); }
+.readout dd { margin: 0; font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
+input[type=range] { width: 100%; accent-color: var(--ink); }
+.row-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--ink-2); }
+
+/* steppers */
+.steps-nav { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.steps-nav button { border: 1px solid var(--rule); background: transparent; border-radius: 99px; padding: 4px 11px; font-size: 13px; cursor: pointer; color: var(--ink-2); }
+.steps-nav button b { font: 500 12px var(--font-mono); margin-right: 5px; color: var(--muted); }
+.steps-nav button[aria-selected=true] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.steps-nav button[aria-selected=true] b { color: var(--surface); opacity: .7; }
+.step { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.4fr); gap: 22px; align-items: start; }
+.step > * { min-width: 0; }
+.step-text { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; font-size: 14.5px; max-width: 62ch; }
+.step-text .note { font-size: 13px; color: var(--muted); }
+.step-figs { display: grid; gap: 12px; }
+.stepper { display: grid; gap: 22px; }
+.step-ctrl { display: flex; align-items: center; gap: 12px; justify-content: space-between; border-top: 1px solid var(--grid); padding-top: 12px; }
+.step-ctrl span { font: 12px var(--font-mono); color: var(--muted); }
+.strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.kv { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13.5px; }
+.kv span { white-space: nowrap; }
+.mini-ctl { display: grid; grid-template-columns: auto 1fr auto; gap: 6px 10px; align-items: center; font-size: 13px; }
+
+/* symbols */
+.symtab { width: 100%; border-collapse: collapse; font-size: 14px; }
+.symtab td { padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+.symtab td:last-child { font: 12.5px var(--font-mono); color: var(--muted); }
+
+#tip { position: fixed; z-index: 10; pointer-events: none; background: var(--ink); color: var(--surface); font: 12px/1.35 var(--font-mono); padding: 6px 8px; border-radius: 6px; max-width: 280px; }
+.placeholder { font-size: 13px; color: var(--muted); padding: 30px 0; text-align: center; }
+mjx-container { color: inherit; }
+mjx-container[display="true"] { margin: 0.4em 0 !important; overflow-x: auto; overflow-y: hidden; }
+
+@media (max-width: 1100px) {
+  .wrap { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "rail" "main"; }
+  .rail { position: static; max-height: none; overflow: visible; }
+  .rail .controls { flex-direction: row; flex-wrap: wrap; align-items: end; gap: 10px 18px; padding: 12px 14px; }
+  .rail .ctl select, .rail .ctl input { width: auto; }
+  .rail .ctl input[type=number] { width: 84px; }
+  .rail-title { flex-basis: 100%; }
+  .key ul { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px 18px; }
+  .rail .status { margin-left: auto; min-width: 200px; padding-top: 0; border-top: 0; }
+}
+@media (max-width: 900px) {
+  .split, .rgrid, .dgrid, .step { grid-template-columns: minmax(0, 1fr); }
+  .rail .status { margin-left: 0; }
+}
+@media (max-width: 520px) {
+  .strip { grid-template-columns: minmax(0, 1fr); }
+  .stage-head { grid-template-columns: 1fr; }
+  .stage-head p { grid-column: 1; }
+}
+</style>
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']],
+    packages: { '[+]': ['boldsymbol'] },
+    macros: {
+      Dn: '\\mathbf{D}_1', Sm: '\\mathbf{S}', ti: '\\tilde{\\mathbf{i}}', vi: '\\mathbf{i}', va: '\\mathbf{a}', ve: '\\mathbf{e}',
+      ah: '\\hat{\\mathbf{a}}', vw: '\\mathbf{w}', vn: '\\mathbf{n}', vs: '\\mathbf{s}', vb: '\\mathbf{b}', dvs: '\\mathbf{d}_s', dvn: '\\mathbf{d}_n', vc: '\\mathbf{c}', vu: '\\mathbf{u}', vx: '\\mathbf{x}',
+      F: '\\mathbf{F}', Lm: '\\mathbf{L}', Hm: '\\mathbf{H}', Cm: '\\mathbf{C}', SP: '\\mathcal{S}', Om: '\\boldsymbol{\\Omega}',
+      Di: '\\boldsymbol{\\Delta}_{\\mathbf{i}}', nuv: '\\boldsymbol{\\nu}', Cov: '\\operatorname{Cov}', Var: '\\operatorname{Var}',
+      nrm: ['\\lVert #1\\rVert', 1]
+    }
+  },
+  loader: { load: ['[tex]/boldsymbol'] },
+  svg: { fontCache: 'global' },
+  startup: { typeset: true }
+};
+</script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.js"></script>
+
+<div class="wrap">
+  <header class="mast">
+    <span class="eyebrow">SHRINE · Sutinjo et al. 2023 · corrected uncertainties</span>
+    <h1>SHRINE Error Explorer</h1>
+    <p class="lede">A mock FRB with a known DM, pushed through the SHRINE structure-maximisation pipeline many times. Follow one noise draw from its I(t, ΔDM) cube down to a single row, the weights that decide how noise moves the structure parameter, and the slope that moves its peak. The ensemble shows where the S23 errors overshoot and where the first-order weights land.</p>
+  </header>
+  <aside class="rail" aria-label="Simulation controls">
+      <form class="controls" id="controls" autocomplete="off">
+        <h2 class="rail-title">Simulation</h2>
+        <div class="ctl"><label for="c-amp">Burst amplitude</label>
+          <select id="c-amp"><option value="0.25">0.25</option><option value="0.5" selected>0.5</option><option value="1">1.0</option><option value="1.5">1.5</option></select></div>
+        <div class="ctl"><label for="c-noise">Noise</label>
+          <select id="c-noise"><option value="0" selected>radiometer</option><option value="1">self-noise (χ²₄)</option></select></div>
+        <div class="ctl"><label for="c-kc">k<sub>c</sub> (blank = get_kc)</label><input id="c-kc" type="number" min="5" max="400" step="1" placeholder="auto"></div>
+        <div class="ctl"><label for="c-O">Order O</label>
+          <select id="c-O"><option>2</option><option selected>3</option><option>4</option><option>5</option></select></div>
+        <div class="ctl"><label for="c-mc">MC draws</label>
+          <select id="c-mc"><option>100</option><option selected>200</option><option>400</option></select></div>
+        <div class="seedrow"><div class="ctl"><label for="c-seed">Seed</label><input id="c-seed" type="number" min="1" step="1" value="1"></div>
+        <button type="button" class="btn" id="b-seed">New seed</button></div>
+        <div class="status" aria-live="polite"><span id="status-txt">Starting…</span><div class="bar"><i id="status-bar"></i></div></div>
+      </form>
+      <details class="key" open>
+        <summary class="rail-title">Colours</summary>
+        <ul>
+          <li><i class="kdot c-new"></i><span><b>Blue</b> the fix: corrected σ, σ<sub>DM</sub> and their ingredients. What should be used.</span></li>
+          <li><i class="kdot c-s23"></i><span><b>Red</b> S23 as published: residual radius, adjusted 𝒮  curve, Eq. 11 interval, d<sub>s</sub>. What is currently used.</span></li>
+          <li><i class="kdot c-mc"></i><span><b>Grey</b> noise and the crowd: MC draws, other cards, raw rows.</span></li>
+          <li><i class="kdot c-ink"></i><span><b>Black</b> what you are following: selected draw, 𝒮 , â.</span></li>
+          <li><i class="kdot c-w"></i><span><b>Violet</b> the weights w: how far each noise sample moves 𝒮 .</span></li>
+          <li><i class="kdot c-sig"></i><span><b>Green</b> the noiseless burst s (mock only) and the low-pass f<sub>k</sub>.</span></li>
+          <li><i class="kdot c-deriv"></i><span><b>Orange</b> differencing and delays: D₁, h<sub>k</sub>, τ<sub>ν</sub>.</span></li>
+          <li><i class="kdot heat"></i><span><b>Heatmaps</b> intensity, pale low to deep high.</span></li>
+        </ul>
+      </details>
+  </aside>
+
+  <main class="main">
+  <!-- 1 -->
+  <section class="stage" id="s1">
+    <div class="stage-head"><span class="stage-no">1</span><h2>Ensemble of noise draws</h2>
+      <p>One two-component burst at the true DM (ΔDM = 0), 84 channels across 1104–1440 MHz, N = 2048 samples of 1 μs, built as in <span class="mono">sim.py</span>. Each card is I(t, ΔDM) from an independent noise draw; its tag gives the ΔDM that maximises the structure parameter. The DM uncertainty is the spread of those numbers. Click a card.</p></div>
+    <div class="split">
+      <div style="display:grid;gap:8px;align-content:start">
+        <div class="deck" id="deck" role="listbox" aria-label="Noise realisations"></div>
+        <p class="hint">Cards show t = 900–1150 μs and ΔDM = −0.04 to +0.04 pc cm⁻³ (bottom to top).</p>
+      </div>
+      <div style="display:grid;gap:16px;align-content:start">
+        <figure><figcaption>𝒮 (ΔDM) for the eight cards</figcaption>
+          <div class="legend"><span class="grp c-ink"><span class="it"><i class="sw"></i>selected</span></span><span class="grp c-mc"><span class="it"><i class="sw"></i>other cards</span><span class="it c-muted"><i class="sw dot"></i>true DM</span></span></div>
+          <canvas id="cv-sd" data-h="190"></canvas></figure>
+        <figure><figcaption>Recovered ΔDM over the Monte Carlo (<span id="hist-n">0</span> draws)</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw box"></i>MC recovered ΔDM</span></span><span class="grp c-new"><span class="it"><i class="sw"></i>corrected σ<sub>DM</sub></span></span><span class="grp c-s23"><span class="it"><i class="sw box"></i>S23 interval (median)</span></span></div>
+          <canvas id="cv-hist" data-h="190"></canvas></figure>
+      </div>
+    </div>
+    <div class="tablewrap">
+      <table class="budget" id="budget">
+        <thead><tr><th>At the true DM</th><th>Monte-Carlo truth</th><th>Corrected</th><th>S23</th></tr></thead>
+        <tbody>
+          <tr><td>σ of the structure parameter 𝒮 </td><td id="b-s-mc">–</td><td id="b-s-new">–</td><td id="b-s-s23">–</td></tr>
+          <tr><td>σ of the recovered DM (pc cm⁻³)</td><td id="b-d-mc">–</td><td id="b-d-new">–</td><td id="b-d-s23">–</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="decomp" id="decomp">S23 overshoot decomposition appears once the Monte Carlo has run.</p>
+  </section>
+
+  <!-- 2 -->
+  <section class="stage" id="s2">
+    <div class="stage-head"><span class="stage-no">2</span><h2 id="s2-title">Realisation #1: I(t, ΔDM)</h2>
+      <p>Each row is the channel sum after removing one trial dispersion. The panel on the right is the structure parameter of every row,\[\SP=\nrm{\Dn\ti},\]with the S23 and corrected uncertainties on the same DM axis. Hover to read a row; click one to open the dynamic spectrum behind it.</p></div>
+    <div class="rgrid">
+      <figure><figcaption>I(t, ΔDM) · selected row outlined</figcaption><canvas id="cv-cube" data-h="360"></canvas></figure>
+      <figure><figcaption>𝒮  per row</figcaption><canvas id="cv-sprof" data-h="360"></canvas></figure>
+    </div>
+    <div class="legend"><span class="grp c-ink"><span class="it"><i class="sw"></i>𝒮 (d)</span></span><span class="grp c-new"><span class="lbl">corrected</span><span class="it"><i class="sw box"></i>±σ per row</span><span class="it"><i class="sw" style="border-top-width:5px"></i>d̂ ± σ<sub>DM</sub></span></span><span class="grp c-s23"><span class="lbl">S23</span><span class="it"><i class="sw"></i>𝒮 (1 + r<sub>d</sub>)</span><span class="it"><i class="sw" style="border-top-width:5px"></i>interval</span></span><span class="grp c-mc"><span class="it c-muted"><i class="sw dot"></i>max 𝒮 (S23 threshold)</span></span></div>
+  </section>
+
+  <!-- 3 -->
+  <section class="stage" id="s3">
+    <div class="stage-head"><span class="stage-no">3</span><h2 id="s3-title">Row ΔDM = 0: the dynamic spectrum behind it</h2>
+      <p>Channel ν is shifted by ΔDM·τ<sub>ν</sub>, with\[\tau_\nu=k_{\rm DM}\left(\nu^{-2}-\nu_{\rm ref}^{-2}\right),\]and the channels are summed into the row below. Away from the true DM the burst tilts across the band (dashed) and the sum smears, which lowers 𝒮 .</p></div>
+    <div class="dgrid">
+      <div style="display:grid;gap:10px;min-width:0">
+        <figure><figcaption>Dynamic spectrum at this trial DM</figcaption><canvas id="cv-dyn" data-h="270"></canvas></figure>
+        <figure><figcaption>The row: Σ<sub>ν</sub> of the above</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw"></i>row i(t)</span></span><span class="grp c-sig"><span class="it"><i class="sw"></i>noiseless burst s(t)</span></span></div>
+          <canvas id="cv-row" data-h="150"></canvas></figure>
+      </div>
+      <div class="side">
+        <label for="r-dm" class="mono" style="font-size:12px;color:var(--muted)">TRIAL ΔDM</label>
+        <input type="range" id="r-dm" min="0" max="80" step="1" value="40">
+        <div class="row-btns"><button class="btn" type="button" id="b-dm-prev" aria-label="Previous trial DM">◀</button><button class="btn" type="button" id="b-dm-next" aria-label="Next trial DM">▶</button><button class="btn" type="button" id="b-dm-peak">Peak</button><button class="btn" type="button" id="b-dm-true">True DM</button></div>
+        <dl class="readout">
+          <dt>ΔDM</dt><dd data-v="rowDM">–</dd>
+          <dt>𝒮  of this row</dt><dd data-v="rowS">–</dd>
+          <dt>delay spread across band</dt><dd data-v="rowSpread">–</dd>
+          <dt>\(\hat\sigma_n\) (k &gt; N/4)</dt><dd data-v="sn">–</dd>
+        </dl>
+        <label class="check"><input type="checkbox" id="c-smooth" checked> Smooth display (4 ch × 3 μs)</label>
+        <p class="hint">The computation always uses the raw 84 channels; smoothing only helps the eye.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section class="stage" id="s4">
+    <div class="stage-head"><span class="stage-no">4</span><h2>From this row to its noise weights</h2>
+      <p>Seven steps from the row above to the weights w that turn noise into a change of 𝒮 , and to why S23's residual radius is so much larger than the scatter those weights predict.</p></div>
+    <div class="stepper" id="st4">
+      <ol class="steps-nav" role="tablist" aria-label="Weights steps">
+        <li><button role="tab" data-k="0"><b>1</b>DCT basis</button></li>
+        <li><button role="tab" data-k="1"><b>2</b>Filters</button></li>
+        <li><button role="tab" data-k="2"><b>3</b>Structure vector</button></li>
+        <li><button role="tab" data-k="3"><b>4</b>Weights</button></li>
+        <li><button role="tab" data-k="4"><b>5</b>Projection</button></li>
+        <li><button role="tab" data-k="5"><b>6</b>Dimensionality</button></li>
+        <li><button role="tab" data-k="6"><b>7</b>Leakage</button></li>
+      </ol>
+
+      <div class="step" data-k="0" role="tabpanel">
+        <div class="step-text">
+          <p>Project the row onto the DCT basis:</p>
+          <p>\[\vc=\Cm^T\vi .\]</p>
+          <p>\(\Cm\) is orthonormal and its columns are the eigenvectors of \(\Dn^T\Dn\) (S23 Eqs. 12–14), so every operator that follows is diagonal here.</p>
+          <p>White noise puts the same variance \(\sigma_n^2\) in every mode. <span class="mono">get_kc</span> sets \(k_c\) = <span class="num" data-v="kc">–</span> where the burst's \(|c_k|\), maximised over trial DMs, falls to the mean maximum of the noise-only modes \(k>N/2\). The burst still carries power above \(\sigma_n\) beyond \(k_c\). Its points split into odd and even \(k\): the burst sits near the middle of the series, so alternate modes sample the cosine and the sine of each component's phase (step 7 shows the consequence).</p>
+          <p>The noise level is measured from this same on-pulse row, in modes where the burst has no power:</p>
+          <p>\[\hat\sigma_n=1.4826\,\mathrm{median}_{k>N/4}\lvert c_k\rvert .\]</p>
+          <div class="kv"><span>this row: \(\hat\sigma_n\) = <span class="num" data-v="sn">–</span></span></div>
+        </div>
+        <div class="step-figs"><figure><figcaption>|c<sub>k</sub>| for this row</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw"></i>|c<sub>k</sub>| data</span><span class="it c-muted"><i class="sw dot"></i>k<sub>c</sub></span></span><span class="grp c-sig"><span class="lbl">|c<sub>s,k</sub>| noiseless burst</span><span class="it"><i class="sw dotf"></i>odd k</span><span class="it"><i class="sw doth"></i>even k</span></span><span class="grp c-new"><span class="lbl">\(\hat\sigma_n\)</span><span class="it"><i class="sw dash"></i>level</span><span class="it"><i class="sw box"></i>band used</span></span></div>
+          <canvas id="f40" data-h="290"></canvas></figure></div>
+      </div>
+
+      <div class="step" data-k="1" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>Three diagonal filters. The low-pass (S23 Eq. 16):</p>
+          <p>\[\Lm=\mathbf{D}_{\rm filter}=\mathrm{diag}(f_k),\qquad f_k=[1+(k/k_c)^{2O}]^{-1}.\]</p>
+          <p>The high-pass, the amplitude response of \(\Dn\):</p>
+          <p>\[\Hm=\boldsymbol\Lambda^{1/2}=\mathrm{diag}(h_k),\qquad h_k=2\sin[(k-1)\pi/2N].\]</p>
+          <p>Combined, the band-pass of S23 Fig. 2:</p>
+          <p>\[\F=\Hm\Lm .\]</p>
+          <p>S23's residual \(\Dn\Sm\Di\) is weighted by \(h_kf_k(1-f_k)\), dashed. It peaks at \(k_c\), where \(f_k=\tfrac12\) and, by the choice of \(k_c\), burst and noise are comparable.</p>
+          <p class="note">Code names: \(f_k\) = <span class="mono">fL</span>, \(h_k\) = <span class="mono">hp</span>, \(h_kf_k\) = <span class="mono">combined</span>.</p>
+        </div>
+        <div class="step-figs"><figure><figcaption>Filter responses (log–log)</figcaption>
+          <div class="legend"><span class="grp c-sig"><span class="it"><i class="sw"></i>f<sub>k</sub> (L)</span></span><span class="grp c-deriv"><span class="it"><i class="sw"></i>h<sub>k</sub> (H)</span></span><span class="grp c-new"><span class="it"><i class="sw"></i>h<sub>k</sub>f<sub>k</sub> (F)</span></span><span class="grp c-s23"><span class="it"><i class="sw dash"></i>h<sub>k</sub>f<sub>k</sub>(1−f<sub>k</sub>) S23 residual</span></span></div>
+          <canvas id="f41" data-h="290"></canvas></figure></div>
+      </div>
+
+      <div class="step" data-k="2" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>The smoothed row \(\ti=\Sm\vi\) and its first difference \(\Dn\ti\). The structure parameter is the length of that vector (S23 Eq. 18):</p>
+          <p>\[\SP=\nrm{\Dn\ti}=\nrm{\F\vc}.\]</p>
+          <p>With \(\vi=\vs+\vn\) the vector splits exactly:</p>
+          <p>\[\Dn\ti=\va+\ve,\qquad \va=\Dn\Sm\vs,\quad \ve=\Dn\Sm\vn .\]</p>
+          <p>In this mock \(\vs\) is known, so both parts can be measured.</p>
+          <div class="kv"><span>this row: 𝒮 = <span class="num" data-v="rowS">–</span></span><span>\(\nrm{\va}\) = <span class="num" data-v="anorm">–</span></span><span>\(\nrm{\ve}\) = <span class="num" data-v="enorm">–</span></span></div>
+        </div>
+        <div class="step-figs">
+          <figure><figcaption>Row and its smoothed version</figcaption>
+            <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw"></i>i(t)</span></span><span class="grp c-ink"><span class="it"><i class="sw"></i>ĩ = S i</span></span><span class="grp c-sig"><span class="it"><i class="sw dash"></i>s(t)</span></span></div>
+            <canvas id="f42a" data-h="170"></canvas></figure>
+          <figure><figcaption>D₁ĩ: its squared length summed is 𝒮 ²</figcaption><canvas id="f42b" data-h="150"></canvas></figure>
+        </div>
+      </div>
+
+      <div class="step" data-k="3" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>Expanding the norm of \(\va+\ve\) with \(\ah=\va/\nrm{\va}\):</p>
+          <p>\[\SP=\nrm{\va}+\ah^T\ve+\frac{\nrm{\ve}^2-(\ah^T\ve)^2}{2\nrm{\va}}+\mathcal{O}(e^3).\]</p>
+          <p>Only \(\ah^T\ve\) is linear in the noise. Moving the operators onto \(\ah\):</p>
+          <p>\[\ah^T\ve=\vn^T\vw,\qquad \vw=\Sm\Dn^T\ah .\]</p>
+          <p>Read the strip left to right: difference the smoothed burst to get \(\ah\), difference it back with \(\Dn^T\), smooth again. So \(\vw\) is minus a smoothed second derivative of the burst: positive on the peaks, negative on the flanks. Noise that lifts a peak sharpens the burst and raises 𝒮 ; noise on a flank broadens it and lowers 𝒮 .</p>
+          <p>In the DCT basis, with \(\ah\) estimated from the smoothed data (solid):</p>
+          <p>\[\vw=\Cm\F\vu,\qquad \vu=\F\Lm\vc/\nrm{\F\Lm\vc}.\]</p>
+          <p>The dotted curve uses the noiseless burst, which only the mock knows:</p>
+          <p>\[\vu=\F\vc_s/\nrm{\F\vc_s}.\]</p>
+        </div>
+        <div class="step-figs">
+          <p class="hint">Visualisation only: \(\vw=\Sm\Dn^T\ah\) applied one operator at a time. x is time (μs), the same window as the panel below; y is dimensionless, since \(\ah\) is a unit vector (\(\sum_t\hat a_t^2=1\)) and \(\Dn\), \(\Sm\) are unitless. So \(\vw\) carries no units and \(\vw^T\vn\) is in units of I, like 𝒮 .</p>
+          <div class="strip">
+            <figure><figcaption>① â = D₁Sĩ / ‖D₁Sĩ‖</figcaption><canvas id="f43a" data-h="140"></canvas></figure>
+            <figure><figcaption>② D₁ᵀâ</figcaption><canvas id="f43b" data-h="140"></canvas></figure>
+            <figure><figcaption>③ w = S D₁ᵀâ</figcaption><canvas id="f43c" data-h="140"></canvas></figure>
+          </div>
+          <figure><figcaption>Weights against the burst</figcaption>
+            <div class="legend"><span class="grp c-w"><span class="lbl">w(t)</span><span class="it"><i class="sw"></i>from data</span><span class="it"><i class="sw dot"></i>from noiseless burst</span></span><span class="grp c-sig"><span class="it"><i class="sw dash"></i>s(t), scaled</span></span></div>
+            <canvas id="f43d" data-h="200"></canvas></figure>
+        </div>
+      </div>
+
+      <div class="step" data-k="4" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>The linear noise term is a weighted sum of the noise samples, with weights fixed by the burst:</p>
+          <p>\[\ah^T\ve=\vw^T\vn=\sum_t w_tn_t .\]</p>
+          <p>Its mean is zero and its variance is</p>
+          <p>\[\sigma^2=\vw^T\Cov(\vn)\,\vw ,\]</p>
+          <p>which for white noise is (replacing S23 Eq. 19)</p>
+          <p>\[\sigma=\sigma_n\nrm{\vw}=\sigma_n\nrm{\F\vu}.\]</p>
+          <div class="stack" data-show="self"><p>With self-noise, using the local variance \(\sigma_t^2\) of the \(k>N/4\) band (bottom panel):</p>
+          <p>\[\sigma^2=\sum_tw_t^2\sigma_t^2 .\]</p></div>
+          <p>The panels use the true \(\ah\), so the running sum ends at the first-order term of this draw:</p>
+          <div class="kv"><span>\(\ah^T\ve\) = <span class="num" data-v="eps">–</span></span><span>second order = <span class="num" data-v="second">–</span></span><span>\(\SP-\nrm{\va}\) = <span class="num" data-v="SmA">–</span></span></div>
+          <div class="kv"><span>σ from the data recipe = <span class="num" data-v="sigRow">–</span></span><span>with the true \(\ah\) = <span class="num" data-v="sigT">–</span></span></div>
+          <p class="note">With \(\vw\) estimated from data, \(\vw^T\vn\) = <span class="num" data-v="epsEst">–</span> for this draw: the estimate differs from \(\ah\) by \(\mathcal{O}(\nrm{\ve}/\nrm{\va})\), which changes single draws at second order but not σ at first order. Monte Carlo at ΔDM = 0: std(\(\ah^T\ve\)) = <span class="num" data-v="mcEps">–</span>, std(𝒮 ) = <span class="num" data-v="mcS">–</span>, median σ = <span class="num" data-v="mcSig">–</span>.</p>
+        </div>
+        <div class="step-figs">
+          <figure><figcaption>Noise in this row and the weights</figcaption>
+            <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw"></i>n(t) = i − s</span></span><span class="grp c-w"><span class="it"><i class="sw"></i>true-â weights w(t), scaled</span></span></div>
+            <canvas id="f44a" data-h="150"></canvas></figure>
+          <figure><figcaption>w<sub>t</sub>n<sub>t</sub> and its running sum; dashed line: the full-series total âᵀe</figcaption>
+            <div class="legend"><span class="grp c-w"><span class="it"><i class="sw box"></i>w<sub>t</sub>n<sub>t</sub></span></span><span class="grp c-ink"><span class="it"><i class="sw"></i>Σ<sub>t′≤t</sub> w<sub>t′</sub>n<sub>t′</sub></span></span></div>
+            <canvas id="f44b" data-h="150"></canvas></figure>
+          <figure data-show="self"><figcaption>Local noise variance σ<sub>t</sub>² (self-noise) and w², scaled</figcaption><canvas id="f44c" data-h="120"></canvas></figure>
+        </div>
+      </div>
+
+      <div class="step" data-k="5" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>S23 bound 𝒮 between (Eq. 8)</p>
+          <p>\[\nrm{\Dn\Sm\ti}\mp\nrm{\Dn\Sm\Di}\]</p>
+          <p>and use the radius as 1σ. The bound is reached only when the noise vector is parallel to \(\ah\).</p>
+          <p>Split S23's residual the same way as the data:</p>
+          <p>\[\Dn\Sm\Di=\dvs+\dvn,\]</p>
+          <p>\[\dvs=\Dn\Sm(\vs-\Sm\vs),\qquad \dvn=\Dn\Sm(\vn-\Sm\vn).\]</p>
+          <p>\(\dvs\) is the burst structure above \(k_c\) that smoothing removes, identical in every draw, and \(\dvn\) is its noise.</p>
+          <p>Each grey dot is one Monte-Carlo draw at ΔDM = 0: the true noise vector \(\ve=\Dn\Sm\vn\) split into its component along \(\ah\) (horizontal) and its length perpendicular to \(\ah\) (vertical), on equal scales. It is long but nearly perpendicular to the structure, where it changes 𝒮  only at second order; only the horizontal spread is an uncertainty. Each red dot is S23's residual \(\Dn\Sm\Di\) from the same draw, split the same way. Lengths are non-negative, so the space below the \(\ah\) axis only holds the vectors' labels.</p>
+          <p>For isotropic noise \(\langle\cos^2\theta\rangle=1/N\). \(\dvn\) is band-limited near \(k_c\), and the count is</p>
+          <p>\[N_{\rm eff}=\langle\nrm{\dvn}^2\rangle/\sigma^2,\]</p>
+          <p>so the residual noise radius exceeds σ by \(\sqrt{N_{\rm eff}}\).</p>
+          <div class="kv"><span>ΔDM = 0: \(N_{\rm eff}\) = <span class="num" data-v="Neff0">–</span></span><span>\(\sqrt{N_{\rm eff}}\) = <span class="num" data-v="sNeff0">–</span></span></div>
+          <p>All arrows start at the origin. Black: a typical \(\ve\) (rms component along \(\ah\), median perpendicular length); its dotted drop onto \(\ah\) is σ, the blue arrow, which is what should be used. Red: the median \(\Dn\Sm\Di\); S23 swing its whole length onto \(\ah\) (dashed arc) and use it as 1σ. The red cloud is offset from the origin by \(\dvs\) (ring), identical in every draw and about half along \(\ah\); the scatter about it comes from \(\dvn\), which is shorter than \(\ve\) because the extra \((1-f_k)\) removes the modes below \(k_c\).</p>
+        </div>
+        <div class="step-figs"><figure><figcaption>Noise vector e and S23's residual, decomposed about â (equal axes)</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="lbl">true noise e = D₁Sn</span><span class="it"><i class="sw box"></i>draws</span><span class="it c-muted"><i class="sw dash"></i>median ‖e‖</span></span><span class="grp c-ink"><span class="it"><b>→</b>typical e</span></span><span class="grp c-s23"><span class="lbl">S23 residual D₁SΔ<sub>i</sub> = d<sub>s</sub> + d<sub>n</sub></span><span class="it"><i class="sw box"></i>draws</span><span class="it"><b>○</b>burst part d<sub>s</sub> (fixed)</span><span class="it"><b>→</b>median, and its length on â (currently used)</span></span><span class="grp c-new"><span class="lbl">corrected</span><span class="it"><i class="sw box"></i>±σ along â</span><span class="it"><b>→</b>σ along â (should be used)</span></span></div>
+          <canvas id="f45" data-h="360"></canvas></figure></div>
+      </div>
+
+      <div class="step" data-k="6" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>With \(\Dn\Sm\Di=\dvs+\dvn\) (step 6) the cross term \(2\dvs^T\dvn\) averages to zero, so</p>
+          <p>\[\langle\nrm{\Dn\Sm\Di}^2\rangle=\nrm{\dvs}^2+\langle\nrm{\dvn}^2\rangle=\langle\nrm{\dvn}^2\rangle(1+\Gamma),\]</p>
+          <p>with the burst-to-noise power in the residual</p>
+          <p>\[\Gamma=\nrm{\dvs}^2/\langle\nrm{\dvn}^2\rangle .\]</p>
+          <p>Dividing by σ² and using \(N_{\rm eff}=\langle\nrm{\dvn}^2\rangle/\sigma^2\) from step 6,</p>
+          <p>\[\frac{\langle\nrm{\Dn\Sm\Di}^2\rangle}{\sigma^2}=N_{\rm eff}(1+\Gamma).\]</p>
+          <p>\(\dvs\) is the same in every draw, so it is not an uncertainty, yet it sits at \(k\simeq k_c\), where the cut was placed. The graph splits the squared lengths by DCT mode, where (S23 Eq. 17)</p>
+          <p>\[d_{s,k}=h_kf_k(1-f_k)\,c_{s,k},\qquad d_{n,k}=h_kf_k(1-f_k)\,\nu_k .\]</p>
+          <p>Odd and even \(k\) are drawn separately: the burst sits near the middle of the series, so alternate modes sample the cosine and the sine of each component's phase, and its two components, 50 μs apart, beat with a period of \(2N/\Delta t\approx82\) modes.</p>
+          <p>At this row Γ = <span class="num" data-v="GammaRow">–</span>. At ΔDM = 0: √N<sub>eff</sub> = <span class="num" data-v="sNeff0">–</span>, √(1+Γ) = <span class="num" data-v="sGam0">–</span>, and S23's division by the double-smoothed \(\nrm{\Dn\Sm\ti}\) adds ×<span class="num" data-v="normf">–</span>. Predicted overshoot ×<span class="num" data-v="predRatio">–</span>; Monte Carlo ×<span class="num" data-v="measRatio">–</span>. Γ grows as (S/N)²: raise the amplitude to watch it.</p>
+        </div>
+        <div class="step-figs"><figure><figcaption>Where ‖D₁SΔ<sub>i</sub>‖² comes from, per DCT mode (this row)</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw box"></i>⟨d<sub>n,k</sub>²⟩ noise</span><span class="it c-muted"><i class="sw dot"></i>k<sub>c</sub></span></span><span class="grp c-s23"><span class="lbl">d<sub>s,k</sub>² burst</span><span class="it"><i class="sw box solid"></i>odd k</span><span class="it"><i class="sw hollow"></i>even k</span></span><span class="grp c-new"><span class="it"><i class="sw"></i>\(\hat\sigma_n\)²(h<sub>k</sub>f<sub>k</sub>u<sub>k</sub>)², summing to σ²</span></span></div>
+          <canvas id="f46" data-h="290"></canvas></figure></div>
+      </div>
+
+      <div class="step-ctrl"><button class="btn" type="button" data-nav="-1">← Previous</button><span data-pos>Step 1 of 7</span><button class="btn primary" type="button" data-nav="1">Next →</button></div>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section class="stage" id="s5">
+    <div class="stage-head"><span class="stage-no">5</span><h2>From the weights to σ<sub>DM</sub></h2>
+      <p>The DM error comes from how the noise term changes with trial DM. Five steps: what a DM step does to the weights, why their time derivative appears, the slope noise it produces, how a slope moves a parabola's peak, and the result against the Monte Carlo. Weights here are those of the selected realisation at its peak row.</p></div>
+    <div class="stepper" id="st5">
+      <ol class="steps-nav" role="tablist" aria-label="DM error steps">
+        <li><button role="tab" data-k="0"><b>1</b>Sliding weights</button></li>
+        <li><button role="tab" data-k="1"><b>2</b>Derivative</button></li>
+        <li><button role="tab" data-k="2"><b>3</b>Slope noise</button></li>
+        <li><button role="tab" data-k="3"><b>4</b>Peak shift</button></li>
+        <li><button role="tab" data-k="4"><b>5</b>σ<sub>DM</sub></button></li>
+      </ol>
+
+      <div class="step" data-k="0" role="tabpanel">
+        <div class="step-text">
+          <p>To first order</p>
+          <p>\[\SP(d)\simeq\nrm{\va(d)}+e_\parallel(d),\]</p>
+          <p>where the noise term at trial DM \(d\) is the component of the noise vector along \(\ah\) (step 4.4),</p>
+          <p>\[e_\parallel(d)=\ah^T\ve_d=\vw^T\vn_d ,\]</p>
+          <p>and the noise row at trial DM \(d\) is</p>
+          <p>\[\vn_d(t)=\sum_{\nu}x_{\nu}(t-d\,\tau_{\nu}),\]</p>
+          <p>with \(\nu_{\rm ref}\) chosen so that \(\sum_{\nu}\tau_{\nu}=0\) (step 2 shows why this is allowed). Move the delay from the noise onto the weights:</p>
+          <p>\[e_\parallel(d_0+\Delta d)=\sum_{\nu}\sum_t w(t+\tau_{\nu}\Delta d)\,x_{\nu}(t).\]</p>
+          <p>The noise in each channel stays put; a DM step slides that channel's copy of the weights by \(\tau_{\nu}\Delta d\). Low-frequency channels slide furthest.</p>
+          <div class="mini-ctl">
+            <label for="r-ch">channel</label><input type="range" id="r-ch" min="0" max="83" step="1" value="80"><span class="num" data-v="chFreq">–</span>
+            <label for="r-dd">Δd</label><input type="range" id="r-dd" min="-0.01" max="0.01" step="0.0005" value="0.004"><span class="num" data-v="ddVal">–</span>
+          </div>
+          <div class="kv"><span>τ<sub>ν</sub> = <span class="num" data-v="tauCh">–</span> μs per pc cm⁻³</span><span>shift τ<sub>ν</sub>Δd = <span class="num" data-v="shiftCh">–</span> μs</span></div>
+        </div>
+        <div class="step-figs"><figure><figcaption>One channel: fixed noise, sliding weights</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw"></i>noise x<sub>ν</sub>(t)</span></span><span class="grp c-w"><span class="it"><i class="sw"></i>w(t)</span><span class="it"><i class="sw dash"></i>w(t + τ<sub>ν</sub>Δd)</span></span></div>
+          <canvas id="f50" data-h="270"></canvas></figure></div>
+      </div>
+
+      <div class="step" data-k="1" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>For small steps</p>
+          <p>\[w(t+\tau_{\nu}\Delta d)-w(t)\simeq\tau_{\nu}\Delta d\,\dot w(t),\]</p>
+          <p>so the change of weight on each noise sample is the time derivative of the weights, scaled by that channel's delay.</p>
+          <p>A delay shared by every channel moves signal and noise together and leaves 𝒮  unchanged, so \(\nu_{\rm ref}\) can be chosen to make \(\sum_{\nu}\tau_{\nu}=0\) and only the spread of the delays counts:</p>
+          <p>\[e_\parallel'=\sum_{\nu}\tau_{\nu}\,\dot{\vw}^T\vx_{\nu},\quad \Var\,e_\parallel'=\sigma_n^2\sigma_\tau^2\nrm{\dot{\vw}}^2 ,\]</p>
+          <p>with</p>
+          <p>\[\sigma_\tau^2=\Var_{\nu}(\tau_{\nu}).\]</p>
+          <p>In the DCT basis</p>
+          <p>\[\nrm{\dot{\vw}}=\nrm{\Om\F\vu},\qquad \omega_k=\pi(k-1)/N\Delta t .\]</p>
+          <div class="kv"><span>σ<sub>τ</sub> = <span class="num" data-v="sigTau">–</span> μs per pc cm⁻³</span><span>\(\nrm{\dot{\vw}}\) = <span class="num" data-v="wdot">–</span> (time series)</span><span>\(\nrm{\Om\F\vu}\) = <span class="num" data-v="oFu">–</span> (spectrum)</span></div>
+        </div>
+        <div class="step-figs">
+          <figure><figcaption>Weight change for the highest and lowest channel (Δd = <span data-v="ddVal">–</span>)</figcaption>
+            <div class="legend"><span class="grp c-w"><span class="it"><i class="sw"></i>top channel</span></span><span class="grp c-deriv"><span class="it"><i class="sw"></i>bottom channel</span></span><span class="grp c-ink"><span class="it"><i class="sw dot"></i>τ<sub>ν</sub>Δd ẇ(t)</span></span></div>
+            <canvas id="f51a" data-h="190"></canvas></figure>
+          <figure><figcaption>Channel delays, ν<sub>ref</sub> chosen so that Σ<sub>ν</sub> τ<sub>ν</sub> = 0</figcaption>
+            <div class="legend"><span class="grp c-ink"><span class="it"><i class="sw box"></i>τ<sub>ν</sub></span></span><span class="grp c-new"><span class="it"><i class="sw box"></i>±σ<sub>τ</sub></span></span></div>
+            <canvas id="f51b" data-h="150"></canvas></figure>
+        </div>
+      </div>
+
+      <div class="step" data-k="2" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>Subtract the noise-free curve \(\nrm{\va(d)}\) from each draw; to first order what remains is \(e_\parallel(d)\). The second-order bias varies slowly with \(d\) and drops out of \(e_\parallel(d)-e_\parallel(d_0)\). Near the true DM it is close to a straight line, and its slope \(e_\parallel'\) changes from draw to draw.</p>
+          <div class="kv"><span>measured std(\(e_\parallel'\)) = <span class="num" data-v="slopeMC">–</span></span></div>
+          <p>Predicted (step 2):</p>
+          <p>\[[\Var\,e_\parallel']^{1/2}=\sigma_n\sigma_\tau\nrm{\Om\F\vu}\]</p>
+          <div class="kv"><span>\(\vu\) from the smoothed data, \(\F\Lm\vc\) (corrected recipe): <span class="num" data-v="slopeData">–</span></span><span>from the noiseless burst, \(\F\vc_s\): <span class="num" data-v="slopeTrue">–</span></span></div>
+          <p>The extra \(\Lm\) in the data estimate removes weight near \(k_c\), which the \(\omega_k\) factor emphasises.</p>
+          <p>Red is what S23 allow for the same quantity. Eq. 11 accepts \(\SP(d)\) against \(\SP(d_0)\) within the radius of the change in the residual \(\Dn\Sm\Di=\dvs+\dvn\):</p>
+          <p>\[\pm\nrm{[\dvs(d)-\dvs(d_0)]+[\dvn(d)-\dvn(d_0)]}.\]</p>
+          <p>Its burst part is fixed and grows with \(\lvert d-d_0\rvert\). Median over the eight cards, it opens with slope <span class="num" data-v="s23slope">–</span> against the measured std(\(e_\parallel'\)) = <span class="num" data-v="slopeMC">–</span>.</p>
+          <p class="note">Units: 𝒮  per pc cm⁻³. Slopes measured by central difference over ±1 trial at ΔDM = 0.</p>
+        </div>
+        <div class="step-figs"><figure><figcaption>\(e_\parallel(d)-e_\parallel(d_0)\), with \(e_\parallel\simeq\SP-\nrm{\va(d)}\), for up to 60 draws</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw"></i>MC draws</span></span><span class="grp c-ink"><span class="it"><i class="sw"></i>selected card</span></span><span class="grp c-new"><span class="it"><i class="sw dash"></i>predicted ±1σ slope</span></span><span class="grp c-s23"><span class="it"><i class="sw"></i>S23 Eq. 11 allowance</span></span></div>
+          <canvas id="f52" data-h="290"></canvas></figure></div>
+      </div>
+
+      <div class="step" data-k="3" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>Near the peak</p>
+          <p>\[\nrm{\va(d)}\simeq\nrm{\va(d_0)}+\tfrac12\nrm{\va}''(d-d_0)^2 .\]</p>
+          <p>The noise adds \(e_\parallel(d_0)+e_\parallel'(d-d_0)\), which tilts the parabola. Setting the derivative to zero:</p>
+          <p>\[\hat d-d_0=-\frac{e_\parallel'}{\nrm{\va}''},\qquad \sigma_{\rm DM}=\frac{[\Var\,e_\parallel']^{1/2}}{\lvert\nrm{\va}''\rvert}.\]</p>
+          <div class="mini-ctl"><label for="r-tilt">\(e_\parallel'\)</label><input type="range" id="r-tilt" min="-3" max="3" step="0.1" value="1"><span class="num" data-v="tiltVal">–</span></div>
+          <div class="kv"><span>\(\nrm{\va}''\) = <span class="num" data-v="Sbarpp">–</span> per (pc cm⁻³)²</span><span>peak moves to <span class="num" data-v="tiltShift">–</span></span></div>
+        </div>
+        <div class="step-figs"><figure><figcaption>Noise-free curve and a tilted copy</figcaption>
+          <div class="legend"><span class="grp c-ink"><span class="lbl">\(\nrm{\va(d)}\)</span><span class="it"><i class="sw"></i>noise-free</span><span class="it"><i class="sw dot"></i>quadratic fit</span></span><span class="grp c-new"><span class="it"><i class="sw"></i>\(\nrm{\va(d)}+e_\parallel'(d-d_0)\)</span></span></div>
+          <canvas id="f53" data-h="290"></canvas></figure></div>
+      </div>
+
+      <div class="step" data-k="4" role="tabpanel" hidden>
+        <div class="step-text">
+          <p>\[\sigma_{\rm DM}\simeq\frac{\sigma_n\,\sigma_\tau\,\nrm{\Om\F\vu}}{\lvert\nrm{\va}''\rvert}\]</p>
+          <div class="kv"><span>median over draws: <span class="num" data-v="sigDM">–</span></span><span>Monte Carlo: <span class="num" data-v="mcDM">–</span></span><span>S23 half-width: <span class="num" data-v="s23hw">–</span></span></div>
+          <p>S23 keep every \(d\) whose adjusted 𝒮  clears the peak (Eq. 11). Even with the radius replaced by the projected \(\sigma_{{\rm peak},d}\), the interval</p>
+          <p>\[\{d:\SP_{\rm peak}-\SP_d\le\kappa\,\sigma_{{\rm peak},d}\}\]</p>
+          <p>has half-width \(2\kappa\sigma_{\rm DM}\), so a 1σ interval needs κ = ½.</p>
+          <p class="note">Each draw's recipe estimates \(\nrm{\va}''\) from a quadratic fit to its own \(\SP(d)\) over ±3 trials, since real data has no noise-free curve. Units pc cm⁻³. The closed form assumes the same profile in every channel; with scattering or drift, use noise cubes from off-pulse voltages (<span class="mono">struct_max_errors.dm_uncertainty</span>).</p>
+        </div>
+        <div class="step-figs"><figure><figcaption>Recovered ΔDM: Monte Carlo against both error estimates</figcaption>
+          <div class="legend"><span class="grp c-mc"><span class="it"><i class="sw box"></i>MC recovered ΔDM</span></span><span class="grp c-new"><span class="it"><i class="sw"></i>N(0, σ<sub>DM</sub>)</span></span><span class="grp c-s23"><span class="it"><i class="sw box"></i>S23 interval (median)</span></span></div>
+          <canvas id="f54" data-h="290"></canvas></figure></div>
+      </div>
+
+      <div class="step-ctrl"><button class="btn" type="button" data-nav="-1">← Previous</button><span data-pos>Step 1 of 5</span><button class="btn primary" type="button" data-nav="1">Next →</button></div>
+    </div>
+  </section>
+
+  <!-- 6 -->
+  <section class="stage" id="s6">
+    <div class="stage-head"><span class="stage-no">6</span><h2>Symbols</h2>
+      <p>Notation follows the corrected S23 markup. Equation numbers refer to the published ApJ version.</p></div>
+    <div class="tablewrap"><table class="symtab"><tbody>
+      <tr><td>\(\vi=\vs+\vn\)</td><td>one row of I(t, ΔDM); noiseless burst; noise</td><td>S23 Eqs. 1, 4</td></tr>
+      <tr><td>\(\ti=\Sm\vi,\ \Di=\vi-\ti\)</td><td>smoothed row; residual</td><td>S23 Eqs. 1, 4</td></tr>
+      <tr><td>\(\Lm=\mathbf{D}_{\rm filter},\ f_k\)</td><td>Butterworth low-pass</td><td>S23 Eqs. 15–16 · fL</td></tr>
+      <tr><td>\(\Hm=\boldsymbol\Lambda^{1/2},\ h_k\)</td><td>first-difference amplitude response</td><td>S23 Eq. 14 · hp</td></tr>
+      <tr><td>\(\F=\Hm\Lm\)</td><td>band-pass, diag(h<sub>k</sub>f<sub>k</sub>)</td><td>S23 Fig. 2 · combined</td></tr>
+      <tr><td>\(\SP=\nrm{\Dn\ti}=\nrm{\F\vc}\)</td><td>structure parameter</td><td>S23 Eq. 18 · sp</td></tr>
+      <tr><td>\(\va=\Dn\Sm\vs,\ \ve=\Dn\Sm\vn,\ \ah\)</td><td>true structure vector, its noise, its direction</td><td>corrected Sect. 2</td></tr>
+      <tr><td>\(\vw=\Sm\Dn^T\ah=\Cm\F\vu\)</td><td>noise weights: \(e_\parallel=\ah^T\ve=\vw^T\vn\)</td><td>projection_weights</td></tr>
+      <tr><td>\(\sigma=\sigma_n\nrm{\F\vu}\)</td><td>1σ of 𝒮  (white noise)</td><td>replaces S23 Eq. 19 · sp_sigma</td></tr>
+      <tr><td>\(\Dn\Sm\Di=\dvs+\dvn\)</td><td>S23's residual: burst part \(\Dn\Sm(\vs-\Sm\vs)\), fixed; noise part \(\Dn\Sm(\vn-\Sm\vn)\)</td><td>corrected App. B</td></tr>
+      <tr><td>\(N_{\rm eff}=\langle\nrm{\dvn}^2\rangle/\sigma^2\)</td><td>dimension count of the residual noise relative to σ</td><td>corrected App. B</td></tr>
+      <tr><td>\(\Gamma=\nrm{\dvs}^2/\langle\nrm{\dvn}^2\rangle\)</td><td>burst-to-noise power in the residual (leakage)</td><td>corrected App. B</td></tr>
+      <tr><td>\(\sigma_\tau,\ \Om\)</td><td>spread of channel delays per unit DM; diag(ω<sub>k</sub>)</td><td>corrected App. B</td></tr>
+      <tr><td>\(\sigma_{\rm DM}\)</td><td>DM uncertainty from the peak perturbation</td><td>replaces the Eq. 11 interval</td></tr>
+    </tbody></table></div>
+  </section>
+  </main>
+</div>
+<div id="tip" hidden></div>

@@ -3,22 +3,38 @@
 
 Sweeps Butterworth order (O) and spectral cutoff (kc) over a 2-D grid.
 
-Two modes, with deliberately different diagnostics:
+Three modes, with deliberately different diagnostics:
 
 * **real** — one observation, components cropped via peak indices. Per-
   component DM_SHRINE / stability maps plus the differential-DM result:
   DM2 - DM1, its formal uncertainty sigma_dDM = sqrt(s1^2+s2^2), and the
   signed significance (DM2-DM1)/sigma_dDM across the (O, kc) grid.
-* **synthetic** — operates exactly like real mode on a user-supplied two-
-  component dynamic spectrum with known component DMs (--true-dms DM1 DM2;
-  --input-dm = prep correction of the sim, usually 0 for raw sims). Noise
-  realisations are added and recovery is judged against the KNOWN truth:
-  accuracy, bias, error calibration (empirical/formal scatter ratio and
-  normalised errors z), and detection sensitivity incl. the false-positive
-  rate. Different injections come from running different sim configs.
+* **synthetic, single burst** (`--true-dm DM`) — operates exactly like real
+  mode on a user-supplied single-burst dynamic spectrum with one known DM.
+  N noise realisations are added and the measured scatter of the recovered
+  DM is compared directly against the SHRINE formal uncertainty: bias,
+  empirical vs formal scatter, the ratio R_sigma, normalised errors z and
+  coverage. This is the cleanest test of where DM errors come from, since
+  nothing about DeltaDM is in the way.
+* **synthetic, differential** (`--true-dms DM1 DM2`) — the same machinery on
+  a two-component dynamic spectrum, reporting the recovered DeltaDM =
+  DM2 - DM1 and its significance. Different injections come from running
+  different sim configs.
+
+In both synthetic modes --input-dm is the prep correction of the sim
+(usually 0 for raw sims). Different injections come from running different
+sim configs, not from this script.
 
 Usage examples
 --------------
+# Single-burst simulation: one known DM, N noise realisations, scatter of the
+# recovered DM vs the SHRINE formal uncertainty across the (O, kc) grid
+python test_filter_sweep.py --mode synthetic \
+    --stokes-i burst.npy --freq freq.npy --time time.npy \
+    --true-dm 335.5 --input-dm 0 \
+    --peak-indices 321 482 \
+    --dm-min 334 --dm-max 337 --target-snr 300 -n 50
+
 # Two-component differential simulation (known truths via --true-dms;
 # --input-dm = prep correction of the sim, usually 0 for raw sims)
 python test_filter_sweep.py --mode synthetic \
@@ -33,7 +49,7 @@ python test_filter_sweep.py --mode real \
     --input-dm 335.87 --peak-indices 321 482 491 880 \
     --dm-min 334.87 --dm-max 336.87 --dm-step 0.004
 
-# Custom filter grid (both modes)
+# Custom filter grid (all modes)
 python test_filter_sweep.py ... -o 1 --o-max 20 --o-step 2 \
     --kc-min 10 --kc-max 100 --kc-step 5
 """
@@ -177,15 +193,17 @@ def parse_args():
     # Mode
     m = p.add_argument_group("Mode")
     m.add_argument("--mode", choices=["synthetic", "real", "both"], default="synthetic",
-                   help="synthetic = two-component differential-DM tests, "
+                   help="synthetic = known-truth recovery tests (single-burst "
+                        "with --true-dm, differential with --true-dms), "
                         "real = single file, both = both")
 
-    # Synthetic parameters (two-component differential-DM simulations)
-    s = p.add_argument_group("Synthetic data (two-component differential-DM sims)")
+    # Synthetic parameters (known-truth recovery simulations)
+    s = p.add_argument_group("Synthetic data (known-truth recovery sims)")
     s.add_argument("--true-dms", nargs=2, type=float, default=None,
-                   help="Known true DMs of the two simulated components: "
-                        "--true-dms DM1 DM2 [pc cm^-3]. Used as the reference "
-                        "truth for recovery, bias and z statistics.")
+                   help="Known true DMs of TWO simulated components: "
+                        "--true-dms DM1 DM2 [pc cm^-3]. Selects the "
+                        "differential-DM variant of synthetic mode. Use "
+                        "--true-dm for a single burst instead.")
     s.add_argument("--n-realisations", "-n", type=int, default=50,
                    help="Noise realisations per (O, kc) in synthetic mode")
     s.add_argument("--target-snr", type=float, default=None,
@@ -218,7 +236,11 @@ def parse_args():
                         "matches the correction actually applied to the data.")
     r.add_argument("--ref-freq", type=float, default=None, help="Reference freq [MHz], default is max(freq)")
     r.add_argument("--true-dm", type=float, default=None,
-                   help="Known true DM for real data (for bias computation)")
+                   help="Known true DM of the burst [pc cm^-3]. In synthetic "
+                        "mode this selects the single-burst variant (one peak "
+                        "region, N noise realisations, scatter of the recovered "
+                        "DM vs the formal uncertainty). In real mode it is only "
+                        "used for the bias column.")
     r.add_argument("--dedisp-mode", choices=["expand", "expand_zero", "expand_nan", "crop"],
                    default="expand_nan",
                    help="Dedispersion edge mode (default: expand; frbop run used expand_nan)")
@@ -539,7 +561,15 @@ def _prepare_component(args, stokes_i, freq_mhz, time_ms, window,
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Synthetic sweep — two-component differential-DM simulations
+# Synthetic sweep — known-truth recovery simulations
+#
+# One runner serves both variants; the difference is purely in the truth
+# bookkeeping, so the dedispersal / (O, kc) machinery is written once:
+#
+#   kind "single"       --one-burst: 1 peak region, truth T (--true-dm).
+#                         Statistics are on DM itself.
+#   kind "differential" --two-burst: 2 peak regions, truths T1, T2
+#                         (--true-dms). Statistics are on DM2 - DM1.
 # ──────────────────────────────────────────────────────────────────────
 
 def _boxcar_window(profile, frac=0.95):
@@ -616,27 +646,81 @@ def _fires_noise_setup(stokes_i, freq_mhz, time_ms, target_snr,
     return sigma_ch, info
 
 
-def run_synthetic_differential(args, output_dir: Path):
-    """Two-component simulation operating exactly like the real pipeline.
+def _resolve_sim_truths(args):
+    """Return (kind, truths) for a synthetic run.
 
-    The user supplies a NOISELESS dynamic spectrum (e.g. FIRES output) with
-    two components whose true DMs are known, crops them with peak indices,
-    and passes the truths via --true-dms DM1 DM2. --input-dm is the DM at
-    which the simulated time series was pre-corrected (0 for raw sims).
-    Every run adds a fresh noise realisation; both windows are dedispersed
-    and evaluated over the same (O, kc) grid as real mode, and recovery is
-    judged against the true component DMs and their difference
-    dDM_inj = DM2 - DM1. Different injections come from running different
-    FIRES configs, not from this script.
+    kind is "single" (one burst, one known DM via --true-dm) or
+    "differential" (two bursts, known DMs via --true-dms DM1 DM2). Exactly
+    one of the two flags must be given, so the variant is always explicit.
+    """
+    if args.true_dm is not None and args.true_dms is not None:
+        raise SystemExit("Error: pass either --true-dm DM (single burst) or "
+                         "--true-dms DM1 DM2 (differential), not both")
+    if args.true_dms is not None:
+        if len(args.true_dms) != 2:
+            raise SystemExit("Error: --true-dms takes exactly two values "
+                             "DM1 DM2; use --true-dm DM for a single burst")
+        return "differential", [float(args.true_dms[0]),
+                                float(args.true_dms[1])]
+    if args.true_dm is not None:
+        return "single", [float(args.true_dm)]
+    raise SystemExit("Error: synthetic mode needs the known truth: "
+                     "--true-dm DM (single burst) or --true-dms DM1 DM2 "
+                     "(differential)")
+
+
+def _resolve_sim_components(args, peak_regions, truths, kind):
+    """Check the peak regions against the requested variant and return the
+    component windows to sweep (1 for single-burst, 2 for differential)."""
+    n_needed = 1 if kind == "single" else 2
+    if len(peak_regions) < n_needed:
+        raise SystemExit(
+            f"Error: {kind} synthetic sims require >= {n_needed} peak "
+            f"region(s) (use --peak-indices)")
+    if len(peak_regions) > n_needed:
+        if kind == "single":
+            raise SystemExit(
+                f"Error: single-burst mode uses one peak region but "
+                f"{len(peak_regions)} were given. Pass a single "
+                "--peak-indices pair, or use --true-dms DM1 DM2 for the "
+                "two-burst differential test.")
+        print(f"  Warning: {len(peak_regions)} peak regions given, using the "
+              f"first {n_needed} (differential mode)")
+    return peak_regions[:n_needed]
+
+
+def run_synthetic(args, output_dir: Path):
+    """Known-truth recovery simulation operating exactly like the real
+    pipeline.
+
+    The user supplies a NOISELESS dynamic spectrum (e.g. FIRES output) and
+    the true DM(s). --input-dm is the DM at which the simulated time series
+    was pre-corrected (0 for raw sims). Every run adds a fresh noise
+    realisation; each window is dedispersed and evaluated over the same
+    (O, kc) grid as real mode, and recovery is judged against the KNOWN
+    truth:
+
+    * kind "single" (--true-dm T, one peak region) — statistics on DM
+      itself, which isolates the DM error budget from anything DeltaDM
+      related.
+    * kind "differential" (--true-dms T1 T2, two peak regions) — statistics
+      on dDM_inj = T2 - T1.
+
+    Different injections come from running different FIRES configs, not from
+    this script.
 
     Returns (rows, meta): rows carry per-(O, kc) aggregates; meta holds the
-    pooled z scores and false-positive count for the plots.
+    pooled z scores and (differential only) the false-positive count.
     """
+    kind, truths = _resolve_sim_truths(args)
+    single = kind == "single"
     orders, kc_values = _sweep_grids(args)
     n_reals = args.n_realisations
+    n_comp = len(truths)
 
+    label = "SINGLE-DM" if single else "DIFFERENTIAL"
     print(f"\n{'=' * 70}")
-    print(f"SYNTHETIC DIFFERENTIAL SWEEP: {n_reals} realisations x "
+    print(f"SYNTHETIC {label} SWEEP: {n_reals} realisations x "
           f"{len(orders)} O x {len(kc_values)} kc")
     print(f"{'=' * 70}")
 
@@ -644,27 +728,26 @@ def run_synthetic_differential(args, output_dir: Path):
     print(f"  Shape: {stokes_i.shape}  "
           f"Freq: {freq_mhz[0]:.1f}-{freq_mhz[-1]:.1f} MHz")
 
-    peak_regions = _resolve_peak_regions(args, time_ms, stokes_i)
-    if len(peak_regions) < 2:
-        raise SystemExit("Error: synthetic differential sims require >= 2 "
-                         "peak regions (use --peak-indices)")
-    if args.true_dms is None or len(args.true_dms) != 2:
-        raise SystemExit("Error: --true-dms DM1 DM2 required for synthetic "
-                         "mode (known component DMs)")
-    T1, T2 = float(args.true_dms[0]), float(args.true_dms[1])
-    dd_inj = T2 - T1
+    peak_regions = _resolve_sim_components(
+        args, _resolve_peak_regions(args, time_ms, stokes_i), truths, kind)
+    dd_inj = None if single else truths[1] - truths[0]
     input_dm = float(args.input_dm)
 
     if args.dm_min is None or args.dm_max is None:
         raise SystemExit("Error: --dm-min and --dm-max required for "
                          "synthetic mode")
+    for ti, T in enumerate(truths):
+        if not args.dm_min <= T <= args.dm_max:
+            print(f"  Warning: true DM {ti+1} = {T:+g} lies outside the "
+                  f"dedispersed range [{args.dm_min:g}, {args.dm_max:g}]; "
+                  f"recovery and bias will be meaningless")
 
     # Static per-component setup: DM grids, dedispersers and output sizes
     # are built once; each realisation re-dedisperses its own noisy cube
     # through them. One shared input DM (the sim's prep correction),
     # exactly like the real pipeline.
     comps = []
-    for pi in range(2):
+    for pi in range(n_comp):
         s, e = peak_regions[pi]
         tm_peak = time_ms[s:e]
         dm_values = _build_dm_grid(freq_mhz, tm_peak, args.dm_min,
@@ -680,11 +763,15 @@ def run_synthetic_differential(args, output_dir: Path):
             stokes_i[:, s:e], (args.dm_min, args.dm_max))
         comps.append({"window": (s, e), "dms": dm_values,
                       "dedisp": dedisperser, "out_size": out_size})
-        print(f"  Component {pi+1}: window {s}-{e}, true DM {[T1, T2][pi]}, "
+        print(f"  Component {pi+1}: window {s}-{e}, true DM {truths[pi]}, "
               f"grid {len(dm_values)} pts [{dm_values[0]:.2f}, "
               f"{dm_values[-1]:.2f}]")
-    print(f"  Input DM (prep correction): {input_dm}; "
-          f"dDM_inj = {dd_inj:+.4g} pc cm^-3")
+    if single:
+        print(f"  Input DM (prep correction): {input_dm}; "
+              f"single burst, true DM = {truths[0]:+.4g} pc cm^-3")
+    else:
+        print(f"  Input DM (prep correction): {input_dm}; "
+              f"dDM_inj = {dd_inj:+.4g} pc cm^-3")
 
     # Noise model: FIRES analytic S/N matching (preferred) or simple
     # data-std scaling as fallback.
@@ -717,9 +804,11 @@ def run_synthetic_differential(args, output_dir: Path):
     print(f"  Dedispersal calls planned: {n_dedisp}")
 
     from collections import defaultdict
-    collect = defaultdict(lambda: {"diffs": [], "sigmas": [],
-                                   "u1s": [], "u2s": [],
-                                   "dm1s": [], "dm2s": []})
+    # Per (O, kc) cell: per-component recovered DMs and formal uncertainties,
+    # one entry per realisation. Everything else (scatter, bias, R_sigma,
+    # z, coverage, and the differential combination) is derived from these.
+    collect = defaultdict(lambda: {"dms": [[] for _ in range(n_comp)],
+                                    "uncs": [[] for _ in range(n_comp)]})
     z_pool = []
     fp_counts = [0, 0]
 
@@ -750,24 +839,26 @@ def run_synthetic_differential(args, output_dir: Path):
         for order in orders:
             for kc in kc_values:
                 try:
-                    dm1, u1, _, _ = _eval_one(CIs[0][1], order, kc, CIs[0][0])
-                    dm2, u2, _, _ = _eval_one(CIs[1][1], order, kc, CIs[1][0])
+                    evals = [_eval_one(CIs[ci][1], order, kc, CIs[ci][0])
+                             for ci in range(n_comp)]
                 except Exception:
                     continue
-                sig = float(np.hypot(u1, u2))
-                diff = float(dm2 - dm1)
                 cell = collect[(order, kc)]
-                cell["diffs"].append(diff)
-                cell["sigmas"].append(sig)
-                cell["u1s"].append(float(u1))
-                cell["u2s"].append(float(u2))
-                cell["dm1s"].append(float(dm1))
-                cell["dm2s"].append(float(dm2))
-                z_pool.append((diff - dd_inj) / sig if sig > 0 else np.nan)
-                S = abs(diff) / sig if sig > 0 else np.nan
-                fp_counts[1] += 1
-                if np.isfinite(S) and S > 3:
-                    fp_counts[0] += 1
+                for ci in range(n_comp):
+                    cell["dms"][ci].append(float(evals[ci][0]))
+                    cell["uncs"][ci].append(float(evals[ci][1]))
+
+                if single:
+                    dm, unc = evals[0][0], evals[0][1]
+                    z_pool.append((dm - truths[0]) / unc if unc > 0 else np.nan)
+                else:
+                    sig = float(np.hypot(evals[0][1], evals[1][1]))
+                    diff = float(evals[1][0] - evals[0][0])
+                    z_pool.append((diff - dd_inj) / sig if sig > 0 else np.nan)
+                    S = abs(diff) / sig if sig > 0 else np.nan
+                    fp_counts[1] += 1
+                    if np.isfinite(S) and S > 3:
+                        fp_counts[0] += 1
 
         done += 1
         _progress(done, n_reals,
@@ -777,40 +868,67 @@ def run_synthetic_differential(args, output_dir: Path):
 
     rows = []
     for (order, kc), cell in sorted(collect.items()):
-        diffs = np.array(cell["diffs"])
-        sigs = np.array(cell["sigmas"])
-        u1s = np.array(cell["u1s"])
-        u2s = np.array(cell["u2s"])
-        dm1s = np.array(cell["dm1s"])
-        dm2s = np.array(cell["dm2s"])
-        mean_diff = float(np.mean(diffs))
-        sigma_emp = float(np.std(diffs))
-        mf = float(np.mean(sigs))
-        z = (diffs - dd_inj) / sigs
-        S = np.abs(diffs) / sigs
-        rows.append({
-            "dmdm_inj": dd_inj,
-            "order": order,
-            "kc": kc,
-            "mean_diff": mean_diff,
-            "bias": mean_diff - dd_inj,
-            "sigma_empirical": sigma_emp,
-            "sigma_formal_mean": mf,
-            "r_sigma": (sigma_emp / mf) if mf > 0 else np.nan,
+        dms = [np.array(v) for v in cell["dms"]]
+        uncs = [np.array(v) for v in cell["uncs"]]
+        mf = float(np.mean(uncs[0])) if n_comp == 1 else float(
+            np.mean(np.hypot(uncs[0], uncs[1])))
+
+        if single:
+            # Statistics on DM itself: the noise-driven scatter of the
+            # recovered DM against the formal SHRINE uncertainty.
+            rec, err = dms[0], dms[0] - truths[0]
+            formal = uncs[0]
+            row = {
+                "true_dm": truths[0],
+                "order": order,
+                "kc": kc,
+                "mean_dm": float(np.mean(rec)),
+                "bias": float(np.mean(err)),
+                "median_abs_err": float(np.median(np.abs(err))),
+                "sigma_empirical": float(np.std(rec)),
+                "sigma_formal_mean": mf,
+                "r_sigma": (float(np.std(rec)) / mf) if mf > 0 else np.nan,
+            }
+        else:
+            rec = dms[1] - dms[0]
+            err = rec - dd_inj
+            formal = np.hypot(uncs[0], uncs[1])
+            row = {
+                "dmdm_inj": dd_inj,
+                "order": order,
+                "kc": kc,
+                "mean_diff": float(np.mean(rec)),
+                "bias": float(np.mean(err)),
+                "median_abs_err": float(np.median(np.abs(err))),
+                "sigma_empirical": float(np.std(rec)),
+                "sigma_formal_mean": mf,
+                "r_sigma": (float(np.std(rec)) / mf) if mf > 0 else np.nan,
+            }
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            z = err / formal
+            S = np.abs(rec) / formal
+        row.update({
             "z_std": float(np.std(z)),
-            "coverage": float(np.mean(np.abs(diffs - dd_inj) <= sigs)),
+            "z_mean": float(np.mean(z)),
+            "coverage": float(np.mean(np.abs(err) <= formal)),
             "frac_S_gt3": float(np.mean(S > 3)),
-            "n_realisations": len(diffs),
-            "sigma1_formal_mean": float(np.mean(u1s)),
-            "sigma2_formal_mean": float(np.mean(u2s)),
-            "dm1_scatter": float(np.std(dm1s - T1)) if len(dm1s) else np.nan,
-            "dm2_scatter": float(np.std(dm2s - T2)) if len(dm2s) else np.nan,
+            "n_realisations": len(rec),
         })
+        if not single:
+            row["sigma1_formal_mean"] = float(np.mean(uncs[0]))
+            row["sigma2_formal_mean"] = float(np.mean(uncs[1]))
+            row["dm1_scatter"] = (float(np.std(dms[0] - truths[0]))
+                                  if dms[0].size else np.nan)
+            row["dm2_scatter"] = (float(np.std(dms[1] - truths[1]))
+                                  if dms[1].size else np.nan)
+        rows.append(row)
 
     meta = {
+        "kind": kind,
         "orders": orders,
         "kcs": kc_values,
-        "true_dms": (T1, T2),
+        "true_dms": tuple(truths),
         "dd_inj": dd_inj,
         "z_pool": np.array(z_pool),
         "fp_counts": fp_counts,
@@ -823,18 +941,23 @@ def run_synthetic_differential(args, output_dir: Path):
 
 
 def _print_sim_summary(args, rows, meta, snr_measured):
-    """Compact post-run statistics: measured S/N plus pooled recovery,
-    calibration and detection numbers across the (O, kc) grid."""
+    """Compact post-run statistics: measured S/N plus pooled recovery and
+    calibration numbers across the (O, kc) grid."""
     if not rows:
         return
+    single = meta["kind"] == "single"
     z = meta["z_pool"]
     z = z[np.isfinite(z)]
-    n_fp, n_tot = meta["fp_counts"]
 
     print(f"\n{'─' * 26} SYNTHETIC RUN SUMMARY {'─' * 26}")
-    print(f"  Truth: DM1={meta['true_dms'][0]:+.4g}, "
-          f"DM2={meta['true_dms'][1]:+.4g}  ->  "
-          f"dDM_inj = {meta['dd_inj']:+.4g} pc cm^-3")
+    if single:
+        print(f"  Truth: single burst, true DM = "
+              f"{meta['true_dms'][0]:+.4g} pc cm^-3")
+    else:
+        n_fp, n_tot = meta["fp_counts"]
+        print(f"  Truth: DM1={meta['true_dms'][0]:+.4g}, "
+              f"DM2={meta['true_dms'][1]:+.4g}  ->  "
+              f"dDM_inj = {meta['dd_inj']:+.4g} pc cm^-3")
     if args.target_snr is not None:
         noise_desc = f"FIRES analytic, target S/N {args.target_snr:g}"
     else:
@@ -850,58 +973,76 @@ def _print_sim_summary(args, rows, meta, snr_measured):
                   f"{np.median(sm):.1f}  std {sm.std():.1f}  "
                   f"range [{sm.min():.1f}, {sm.max():.1f}] (N={sm.size})")
 
+    what = "DM" if single else "Delta-DM"
     bias = np.array([r["bias"] for r in rows])
     semp = np.array([r["sigma_empirical"] for r in rows])
     sform = np.array([r["sigma_formal_mean"] for r in rows])
     rsig = np.array([r["r_sigma"] for r in rows])
     cov = np.array([r["coverage"] for r in rows])
     with np.errstate(invalid="ignore"):
-        print(f"  Delta-DM recovery (median over cells unless stated):")
+        print(f"  {what} recovery (median over cells unless stated):")
         print(f"    bias         : median {np.nanmedian(bias):+.4g}   "
               f"mean {np.nanmean(bias):+.4g}   "
               f"|max| {np.nanmax(np.abs(bias)):.4g} pc cm^-3")
         print(f"    sigma empir. : median {np.nanmedian(semp):.4g}   "
               f"(best cell {np.nanmin(semp):.4g})")
-        print(f"    sigma formal : median {np.nanmedian(sform):.4g}   "
+        print(f"    sigma SHRINE : median {np.nanmedian(sform):.4g}   "
               f"mean {np.nanmean(sform):.4g} pc cm^-3")
         print(f"    R_sigma      : median {np.nanmedian(rsig):.3f}   "
               f"range [{np.nanmin(rsig):.3f}, {np.nanmax(rsig):.3f}]")
         print(f"  Calibration:")
         print(f"    z-score      : mean {z.mean():+.3f}  std {z.std():.3f}  "
               f"|z|>3: {(np.abs(z) > 3).mean():.2%} (N={z.size})")
+
         print(f"    coverage     : median {np.nanmedian(cov):.1%}   "
               f"min {np.nanmin(cov):.1%}")
-    fp_frac = n_fp / n_tot if n_tot else float("nan")
-    print(f"  Detection:")
-    print(f"    S>3 rate     : {fp_frac:.2%} of trials "
-          f"(Gaussian expectation {_GAUSS_TAIL_3SIG:.2%}; "
-          f"n={n_fp}/{n_tot})")
+    if not single:
+        n_fp, n_tot = meta["fp_counts"]
+        fp_frac = n_fp / n_tot if n_tot else float("nan")
+        print(f"  Detection:")
+        print(f"    S>3 rate     : {fp_frac:.2%} of trials "
+              f"(Gaussian expectation {_GAUSS_TAIL_3SIG:.2%}; "
+              f"n={n_fp}/{n_tot})")
     print("─" * 78)
 
 
 def plot_sim_recovery(rows, meta, output_dir: Path, ext: str):
-    """Sim plot 1: distribution of recovered dDM over the (O, kc) grid
-    against the known truth, plus the bias heatmap."""
+    """Sim plot 1: distribution of the recovered quantity over the (O, kc)
+    grid against the known truth, plus the bias heatmap. The quantity is
+    DM itself (single-burst) or dDM_21 (differential)."""
     if not rows:
         return
-    dd_inj = meta["dd_inj"]
-    means = np.array([r["mean_diff"] for r in rows])
+    single = meta["kind"] == "single"
+    if single:
+        truth = meta["true_dms"][0]
+        means = np.array([r["mean_dm"] for r in rows])
+        xlabel = r"Recovered $\langle\mathrm{DM}\rangle$ [pc cm$^{-3}$]"
+        htitle = (r"Single burst, true $\mathrm{DM}=" rf"{truth:+.3g}$")
+        btitle = (r"$b=\langle\mathrm{DM}^{\,\rm rec}\rangle"
+                  r"-\mathrm{DM}^{\,\rm true}$")
+    else:
+        truth = meta["dd_inj"]
+        means = np.array([r["mean_diff"] for r in rows])
+        xlabel = (r"Recovered $\langle\Delta\mathrm{DM}_{21}\rangle$ "
+                  "[pc cm$^{-3}$]")
+        htitle = (r"$\Delta\mathrm{DM}_{21}=\mathrm{DM}_2-\mathrm{DM}_1$"
+                  rf"$={{{truth:+.3g}}}$")
+        btitle = (r"$b=\langle\Delta\mathrm{DM}_{21}^{\,\rm rec}\rangle"
+                  r"-\Delta\mathrm{DM}_{21}^{\,\rm inj}$")
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
 
     ax = axes[0]
     ax.hist(means, bins=30, alpha=0.75, color="C0", edgecolor="k",
             linewidth=0.4)
-    ax.axvline(dd_inj, color="k", linestyle="--", linewidth=1.2,
-               label=f"truth $={dd_inj:+.3g}$")
+    ax.axvline(truth, color="k", linestyle="--", linewidth=1.2,
+               label=f"truth $={truth:+.3g}$")
     med = float(np.median(means))
     ax.axvline(med, color="C1", linewidth=1.0, label=f"median $={med:+.4f}$")
-    closest = float(np.nanmin(np.abs(means - dd_inj)))
-    ax.set_xlabel(r"Recovered $\langle\Delta\mathrm{DM}_{21}\rangle$ "
-                  "[pc cm$^{-3}$]")
+    closest = float(np.nanmin(np.abs(means - truth)))
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Cells in (O, kc) grid")
-    ax.set_title(r"$\Delta\mathrm{DM}_{21}=\mathrm{DM}_2-\mathrm{DM}_1$"
-                 f" across {len(rows)} (O, kc) settings"
+    ax.set_title(htitle + f" across {len(rows)} (O, kc) settings"
                  f"\n(closest cell within {closest:.2g} of truth)")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
@@ -910,109 +1051,173 @@ def plot_sim_recovery(rows, meta, output_dir: Path, ext: str):
                                        meta["kcs"])
     vabs = np.nanmax(np.abs(bias_g)) * 1.05 or 1e-3
     draw_heatmap(axes[1], bias_g, kcs, orders, "RdBu_r", -vabs, vabs,
-                 clabel=r"$b$ [pc cm$^{-3}$]",
-                 title=r"$b=\langle\Delta\mathrm{DM}_{21}^{\,\rm rec}\rangle"
-                       r"-\Delta\mathrm{DM}_{21}^{\,\rm inj}$")
+                 clabel=r"$b$ [pc cm$^{-3}$]", title=btitle)
     axes[1].axhline(y=3, color="k", linestyle="--", linewidth=0.7, alpha=0.5)
     _save_fig(output_dir, "sim_recovery", ext)
 
 
-def plot_sim_calibration(rows, meta, output_dir: Path, ext: str):
-    """Sim calibration figure (2 cols x 3 rows): per-component formal
-    uncertainties, pooled empirical vs formal differential scatter, then
-    the calibration ratio map and normalised-error distribution."""
-    if not rows:
-        return
-    fig, axes = plt.subplots(3, 2, figsize=(14, 17))
-    orders, kcs = meta["orders"], meta["kcs"]
 
-    def _mean_map(key):
-        g = np.full((len(orders), len(kcs)), np.nan)
-        for row in rows:
-            g[orders.index(row["order"]), kcs.index(row["kc"])] = row[key]
-        return g
+def _calibration_titles(single):
+    """Axis titles for the simulated-calibration figure.
 
-    # Row 1: per-component formal uncertainties on a shared colour scale
-    s1_map = _mean_map("sigma1_formal_mean")
-    s2_map = _mean_map("sigma2_formal_mean")
-    smax = 1.05 * float(np.nanmax([np.nanmax(s1_map), np.nanmax(s2_map)])
-                        ) or 1.0
-    draw_heatmap(axes[0, 0], s1_map, kcs, orders, "viridis", 0.0, smax,
-                 clabel=r"$\sigma_1$ [pc cm$^{-3}$]",
-                 title=r"Component 1 formal uncertainty"
-                       "\n"
-                       r"$\sigma_1=\langle u_1\rangle_{\rm realisations}$")
-    draw_heatmap(axes[0, 1], s2_map, kcs, orders, "viridis", 0.0, smax,
-                 clabel=r"$\sigma_2$ [pc cm$^{-3}$]",
-                 title=r"Component 2 formal uncertainty"
-                       "\n"
-                       r"$\sigma_2=\langle u_2\rangle_{\rm realisations}$")
+    The quoted uncertainty is not a propagated error bar. The structure
+    maximiser inflates the structure parameter as SP_k -> SP_k (1 + eps_k),
+    with eps_k = ||HP . DCT(dI)|| / ||HP . LPF . DCT(I)||, and reads off the
+    contiguous DM range over which the inflated SP stays at or above its own
+    peak. sigma_- and sigma_+ are the distances from the recovered DM to the
+    two ends of that range, and the quoted width is their mean -- a
+    quadrature sum is only used to combine two components in differential
+    mode.
+    """
+    if single:
+        return (r"Quoted SHRINE DM uncertainty (mean over realisations)"
+                "\n" r"$\sigma_{\rm SHRINE}=\frac{1}{2}"
+                r"\left(\sigma_-+\sigma_+\right)$",
+                r"Measured DM scatter (std over realisations)"
+                "\n" r"$\sigma_{\rm empirical}=\mathrm{std}"
+                r"\left(\mathrm{DM}_{\rm rec}\right)$",
+                r"$z=\left(\mathrm{DM}_{\rm rec}-\mathrm{DM}_{\rm true}"
+                r"\right)/\sigma_{\rm SHRINE}$")
+    return (r"Quoted uncertainty on $\Delta\mathrm{DM}_{21}$ "
+            r"(mean over realisations)"
+            "\n" r"$\sigma_{\Delta}=\sqrt{\sigma_1^2+\sigma_2^2}$",
+            r"Measured scatter on $\Delta\mathrm{DM}_{21}$"
+            "\n" r"$\sigma_{\rm empirical}=\mathrm{std}\left("
+            r"\Delta\mathrm{DM}_{21}^{\,\rm rec}\right)$",
+            r"$z=\left(\Delta\mathrm{DM}_{21}^{\,\rm rec}-"
+            r"\Delta\mathrm{DM}_{21}^{\,\rm inj}\right)/"
+            r"\sigma_{\Delta}$")
 
-    # Row 2: pooled differential scatter, empirical vs formal
-    # (shared colour scale so the two maps are directly comparable)
-    se_map = _mean_map("sigma_empirical")
-    sf_map = _mean_map("sigma_formal_mean")
-    dmax = 1.05 * float(np.nanmax([np.nanmax(se_map), np.nanmax(sf_map)])
-                        ) or 1.0
-    draw_heatmap(axes[1, 0], se_map, kcs, orders, "viridis", 0.0, dmax,
-                 clabel=r"$\sigma_{\rm empirical}$ [pc cm$^{-3}$]",
-                 title=r"Empirical differential scatter"
-                       "\n"
-                       r"$\sigma_{\rm empirical}=\mathrm{std}("
-                       r"\Delta\mathrm{DM}_{21})$")
-    draw_heatmap(axes[1, 1], sf_map, kcs, orders, "viridis", 0.0, dmax,
-                 clabel=r"$\langle\sigma_{\rm formal}\rangle$ "
-                        r"[pc cm$^{-3}$]",
-                 title=r"Mean formal differential uncertainty"
-                       "\n"
-                       r"$\langle\sigma_{\rm formal}\rangle="
-                       r"\langle\sqrt{\sigma_1^2+\sigma_2^2}\rangle$")
 
-    # Row 3: calibration ratio + z distribution
-    r_map = np.full((len(orders), len(kcs)), np.nan)
-    counts = np.zeros((len(orders), len(kcs)))
-    for row in rows:
-        oi, ki = orders.index(row["order"]), kcs.index(row["kc"])
-        if np.isfinite(row["r_sigma"]):
-            r_map[oi, ki] = ((r_map[oi, ki] if np.isfinite(r_map[oi, ki])
-                              else 0.0) + row["r_sigma"])
-            counts[oi, ki] += 1
-    r_map = np.where(counts > 0, r_map / np.maximum(counts, 1), np.nan)
-    draw_heatmap(axes[2, 0], r_map, kcs, orders, "coolwarm",
-                 vmin=0, vmax=None,
-                 clabel=r"$R_\sigma$",
-                 title=r"$R_\sigma=\sigma_{\rm empirical}/"
-                       r"\langle\sigma_{\rm formal}\rangle$"
-                       "\n(1 = well calibrated, >1 = overconfident, "
-                       "<1 = conservative)")
-    axes[2, 0].axhline(y=3, color="k", linestyle="--", linewidth=0.7,
-                       alpha=0.5)
-
-    z = meta["z_pool"]
-    z = z[np.isfinite(z)]
-    ax = axes[2, 1]
+def _plot_z_hist(ax, z, z_expr):
+    """Pooled normalised-error histogram against the unit Gaussian."""
     ax.hist(z, bins=60, range=(-6, 6), density=True, alpha=0.7,
             color="C0", edgecolor="k", linewidth=0.3)
     xs = np.linspace(-6, 6, 300)
     ax.plot(xs, np.exp(-0.5 * xs**2) / np.sqrt(2 * np.pi), "k--",
             linewidth=1.2, label=r"$\mathcal{N}(0,1)$")
-    frac3 = float(np.mean(np.abs(z) > 3))
     ax.set_xlabel(r"$z$")
     ax.set_ylabel("Probability density")
-    ax.set_title(r"$z=\left(\Delta\mathrm{DM}_{21}^{\,\rm rec}-"
-                 r"\Delta\mathrm{DM}_{21}^{\,\rm inj}\right)/"
-                 r"\sigma_{\rm formal}$"
-                 f"\nN={z.size}, std={np.std(z):.3f}, "
-                 f"|z|>3: {frac3:.2%}")
+    ax.set_title(z_expr
+                 + f"\nN={z.size}, std={np.std(z):.3f}, "
+                 f"|z|>3: {float(np.mean(np.abs(z) > 3)):.2%}")
     ax.legend()
     ax.grid(True, alpha=0.3)
+
+
+def _plot_r_sigma(ax, r_map, kcs, orders, quoted=r"\sigma_{\rm SHRINE}"):
+    """Calibration-ratio map (1 = calibrated, >1 = overconfident)."""
+    draw_heatmap(ax, r_map, kcs, orders, "magma", vmin=0, vmax=None,
+                 clabel=r"$R_\sigma$",
+                 title=rf"$R_\sigma=\sigma_{{\rm empirical}}/{quoted}$"
+                       "\n(1 = well calibrated, >1 = overconfident, "
+                       "<1 = conservative)")
+    ax.axhline(y=3, color="k", linestyle="--", linewidth=0.7, alpha=0.5)
+
+
+def _calibration_single(axes, rows, meta, orders, kcs, mean_map,
+                        formal_title, emp_title, z_expr):
+    """Single-burst layout: the quoted uncertainty and the measured scatter
+    for DM itself (shared scale), their ratio, and the pooled z
+    distribution."""
+    # Row 1: quoted uncertainty and measured scatter on a shared scale
+    sf_map = mean_map("sigma_formal_mean")
+    se_map = mean_map("sigma_empirical")
+    #dmax = 1.05 * float(np.nanmax([np.nanmax(se_map), np.nanmax(sf_map)])) or 1.0
+    draw_heatmap(axes[0, 0], sf_map, kcs, orders, "viridis", 0.0, np.nanmax(sf_map),
+                 clabel=r"$\sigma_{\rm SHRINE}$ [pc cm$^{-3}$]",
+                 title=formal_title)
+    draw_heatmap(axes[0, 1], se_map, kcs, orders, "plasma", 0.0, np.nanmax(se_map),
+                 clabel=r"$\sigma_{\rm empirical}$ [pc cm$^{-3}$]",
+                 title=emp_title)
+
+    # Row 2: calibration ratio + pooled z distribution
+    _plot_r_sigma(axes[1, 0], mean_map("r_sigma"), kcs, orders)
+    z = meta["z_pool"]
+    _plot_z_hist(axes[1, 1], z[np.isfinite(z)], z_expr)
+
+
+
+def _calibration_differential(axes, rows, meta, orders, kcs, mean_map,
+                             formal_title, emp_title, z_expr):
+    """Differential layout: per-component formal uncertainties, then the
+    pooled empirical vs formal differential scatter, the calibration ratio
+    and the normalised-error distribution."""
+    # Row 1: per-component formal uncertainties on a shared colour scale
+    s1_map = mean_map("sigma1_formal_mean")
+    s2_map = mean_map("sigma2_formal_mean")
+    #smax = 1.05 * float(np.nanmax([np.nanmax(s1_map), np.nanmax(s2_map)])) or 1.0
+    draw_heatmap(axes[0, 0], s1_map, kcs, orders, "viridis", 0.0, np.nanmax(s1_map),
+                 clabel=r"$\sigma_1$ [pc cm$^{-3}$]",
+                 title=r"Quoted uncertainty on $\mathrm{DM}_1$ alone"
+                       "\n"
+                       r"$\sigma_1=\frac{1}{2}\left(h^{-}_{1}+h^{+}_{1}"
+                       r"\right)$, same SP-contour recipe as below")
+    draw_heatmap(axes[0, 1], s2_map, kcs, orders, "viridis", 0.0, np.nanmax(s2_map),
+                 clabel=r"$\sigma_2$ [pc cm$^{-3}$]",
+                 title=r"Quoted uncertainty on $\mathrm{DM}_2$ alone"
+                       "\n"
+                       r"$\sigma_2=\frac{1}{2}\left(h^{-}_{2}+h^{+}_{2}"
+                       r"\right)$, same SP-contour recipe as below")
+
+    # Row 2: pooled differential scatter, empirical vs formal
+    # (shared colour scale so the two maps are directly comparable)
+    se_map = mean_map("sigma_empirical")
+    sf_map = mean_map("sigma_formal_mean")
+    dmax = 1.05 * float(np.nanmax([np.nanmax(se_map), np.nanmax(sf_map)])
+                        ) or 1.0
+    draw_heatmap(axes[1, 0], se_map, kcs, orders, "viridis", 0.0, dmax,
+                 clabel=r"$\sigma_{\rm empirical}$ [pc cm$^{-3}$]",
+                 title=emp_title)
+    draw_heatmap(axes[1, 1], sf_map, kcs, orders, "viridis", 0.0, dmax,
+                 clabel=r"$\sigma_{\Delta}$ [pc cm$^{-3}$]",
+                 title=formal_title)
+
+    # Row 3: calibration ratio + z distribution
+    _plot_r_sigma(axes[2, 0], mean_map("r_sigma"), kcs, orders,
+                  quoted=r"\sigma_{\Delta}")
+    z = meta["z_pool"]
+    _plot_z_hist(axes[2, 1], z[np.isfinite(z)], z_expr)
+
+
+def plot_sim_calibration(rows, meta, output_dir: Path, ext: str):
+    """Sim calibration figure.
+
+    Differential layout (2 cols x 3 rows): per-component quoted uncertainties,
+    the measured scatter vs the quoted uncertainty on dDM_21, the
+    calibration ratio map and the normalised-error distribution.
+
+    Single-burst layout (2 cols x 2 rows): the same diagnostics applied to
+    DM itself — quoted uncertainty, measured scatter, their ratio and the
+    pooled z distribution.
+    """
+    if not rows:
+        return
+    single = meta["kind"] == "single"
+    nrows = 2 if single else 3
+    fig, axes = plt.subplots(nrows, 2, figsize=(14, 5.6 * nrows),
+                             squeeze=False)
+    orders, kcs = meta["orders"], meta["kcs"]
+
+    def mean_map(key):
+        """Scatter one per-cell row key into an (order, kc) grid."""
+        g = np.full((len(orders), len(kcs)), np.nan)
+        for row in rows:
+            g[orders.index(row["order"]), kcs.index(row["kc"])] = row[key]
+        return g
+
+    titles = _calibration_titles(single)
+    layout = _calibration_single if single else _calibration_differential
+    layout(axes, rows, meta, orders, kcs, mean_map, *titles)
     _save_fig(output_dir, "sim_calibration", ext)
 
 
 def plot_sim_sensitivity(rows, meta, output_dir: Path, ext: str):
-    """Sim plot 4: significance behaviour at this injection -- distribution
-    of per-cell S and the false-positive rate versus Gaussian expectation."""
-    if not rows:
+    """Sim plot 3 (differential only): significance behaviour at this
+    injection -- distribution of per-cell S and the false-positive rate
+    versus the Gaussian expectation. Meaningless for a single burst, where
+    there is no injected difference to detect."""
+    if not rows or meta["kind"] != "differential":
         return
 
     s_cells = np.array([abs(r["mean_diff"]) /
@@ -1543,8 +1748,10 @@ def main():
     print(f"Output directory: {output_dir}")
 
     if args.mode in ("synthetic", "both"):
-        synth_rows, synth_meta = run_synthetic_differential(args, output_dir)
-        save_csv(synth_rows, output_dir, "synthetic_differential.csv")
+        synth_rows, synth_meta = run_synthetic(args, output_dir)
+        name = ("synthetic_single" if synth_meta["kind"] == "single"
+                else "synthetic_differential")
+        save_csv(synth_rows, output_dir, f"{name}.csv")
         if synth_rows:
             plot_sim_recovery(synth_rows, synth_meta, output_dir, args.ext)
             plot_sim_calibration(synth_rows, synth_meta, output_dir, args.ext)

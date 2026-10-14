@@ -99,8 +99,7 @@ function makeCore() {
     const fft = makeFFT(N), D = makeDCT(N, fft);
     let tm = 0; for (const v of tau) tm += v; tm /= NCH;
     let tv = 0; for (const v of tau) tv += (v - tm) ** 2; const sigTau = Math.sqrt(tv / NCH);
-    const omega = new Float64Array(N); for (let k = 0; k < N; k++) omega[k] = Math.PI * k / (N * dt);
-    return { N, NCH, dt, freqs, fref, tau, tauMean: tm, sigTau, dms: Float64Array.from(dms), ND, i0, prof, amp, fft, dct: D.dct, idct: D.idct, omega, selfnoise: !!p.selfnoise };
+    return { N, NCH, dt, freqs, fref, tau, tauMean: tm, sigTau, dms: Float64Array.from(dms), ND, i0, prof, amp, fft, dct: D.dct, idct: D.idct, selfnoise: !!p.selfnoise };
   }
 
   // channel intensities, channel-normalised exactly as sim.realise
@@ -140,14 +139,14 @@ function makeCore() {
     return { re, im };
   }
 
-  // I(DM,t) cube: channel ch shifted by d*tau_ch (Fourier), summed. jmax limits rfft bins (band-limited fast mode).
+  // I(DM,t) cube: channel nu advanced by d*tau_nu samples (Fourier), summed: n(t;d) = sum_nu x_nu(t + d tau_nu). jmax limits rfft bins (band-limited fast mode).
   function dedisperse(ctx, F, jmax) {
     const { N, NCH, ND, dms, tau, dt, fft } = ctx, H = N >> 1;
     const NK = Math.min(jmax == null ? H : jmax, H) + 1;
     const Pr = new Float64Array(NCH * NK), Pi = new Float64Array(NCH * NK), Rr = new Float64Array(NCH * NK), Ri = new Float64Array(NCH * NK);
     const step = dms[1] - dms[0];
     for (let ch = 0; ch < NCH; ch++) for (let k = 0; k < NK; k++) {
-      const nu = k / (N * dt), ph0 = -2 * Math.PI * nu * tau[ch] * dms[0], ph = -2 * Math.PI * nu * tau[ch] * step, o = ch * NK + k;
+      const nu = k / (N * dt), ph0 = 2 * Math.PI * nu * tau[ch] * dms[0], ph = 2 * Math.PI * nu * tau[ch] * step, o = ch * NK + k;
       Pr[o] = Math.cos(ph0); Pi[o] = Math.sin(ph0); Rr[o] = Math.cos(ph); Ri[o] = Math.sin(ph);
     }
     const out = new Float32Array(ND * N), xr = new Float64Array(N), xi = new Float64Array(N);
@@ -176,7 +175,7 @@ function makeCore() {
     for (let ch = 0; ch < NCH; ch++) {
       const fo = ch * N;
       for (let k = 0; k <= H; k++) {
-        const ph = -2 * Math.PI * (k / (N * dt)) * tau[ch] * d, c = Math.cos(ph), s = Math.sin(ph);
+        const ph = 2 * Math.PI * (k / (N * dt)) * tau[ch] * d, c = Math.cos(ph), s = Math.sin(ph);
         const fr = F.re[fo + k], fi = F.im[fo + k];
         xr[k] += fr * c - fi * s; xi[k] += fr * s + fi * c;
       }
@@ -194,7 +193,7 @@ function makeCore() {
     for (let ch = 0; ch < NCH; ch++) {
       const fo = ch * N; xr.fill(0); xi.fill(0);
       for (let k = 0; k <= H; k++) {
-        const ph = -2 * Math.PI * (k / (N * dt)) * tau[ch] * d, c = Math.cos(ph), s = Math.sin(ph);
+        const ph = 2 * Math.PI * (k / (N * dt)) * tau[ch] * d, c = Math.cos(ph), s = Math.sin(ph);
         const fr = F.re[fo + k], fi = F.im[fo + k];
         xr[k] = fr * c - fi * s; xi[k] = fr * s + fi * c;
       }
@@ -249,10 +248,10 @@ function makeCore() {
       let s1 = 0, s2 = 0, s3 = 0, s4 = 0;
       for (let k = 0; k < N; k++) {
         const Fc = F[k] * c[k], FLc = Fc * f[k];
-        s1 += Fc * Fc; s2 += FLc * FLc; s3 += (F[k] * (1 - f[k]) * c[k]) ** 2; s4 += (F[k] * FLc) ** 2;
+        s1 += Fc * Fc; s2 += FLc * FLc; s3 += (F[k] * (1 - f[k]) * c[k]) ** 2; s4 += (F[k] * Fc) ** 2;
       }
       S[m] = Math.sqrt(s1); FLn[m] = Math.sqrt(s2); unc[m] = Math.sqrt(s3) / FLn[m];
-      if (!opt.bandLimited) { sn[m] = sigmaHatN(c, N); sig[m] = sn[m] * Math.sqrt(s4) / FLn[m]; }
+      if (!opt.bandLimited) { sn[m] = sigmaHatN(c, N); sig[m] = sn[m] * Math.sqrt(s4) / S[m]; }   // sigma_n ||F u||, u = F c / ||F c||
     }
     const dpk = argmax(S), dhat = peakRefine(S, dms);
     const rel = new Float64Array(ND);
@@ -265,44 +264,110 @@ function makeCore() {
     for (let m = 0; m < ND; m++) { const adj = S[m] + S[m] * rel[m]; if (!cont && adj >= mx) { cont = true; ranges.push([m]); } else if (cont && adj < mx) { cont = false; ranges[ranges.length - 1].push(m); } }
     let lo = null, hi = null;
     if (ranges.length) { lo = dms[ranges[0][0]]; const last = ranges[ranges.length - 1]; hi = last.length === 2 ? dms[last[1]] : dms[ND - 1]; }
-    // curvature from a quadratic fit over peak +-3 trials
-    const a = Math.max(dpk - 3, 0), b = Math.min(dpk + 4, ND), xs = [], ys = [];
-    for (let m = a; m < b; m++) { xs.push(dms[m]); ys.push(S[m]); }
-    const q = quadfit(xs, ys, dms[dpk]), Spp = 2 * q[2];
-    // direction u at the peak row and ||Omega F u||
-    let uNorm2 = 0; const u = new Float64Array(N);
-    for (let k = 0; k < N; k++) { u[k] = F[k] * f[k] * C[dpk * N + k]; uNorm2 += u[k] * u[k]; }
-    const un = Math.sqrt(uNorm2); let oFu = 0, Fu = 0;
-    for (let k = 0; k < N; k++) { u[k] /= un; oFu += (ctx.omega[k] * F[k] * u[k]) ** 2; Fu += (F[k] * u[k]) ** 2; }
-    oFu = Math.sqrt(oFu); Fu = Math.sqrt(Fu);
-    return { C, S, FLn, unc, rel, sig, sn, dpk, dhat, lo, hi, quad: { x0: dms[dpk], c: q, a, b }, Spp, u, oFu, Fu };
+    return { C, S, FLn, unc, rel, sig, sn, dpk, dhat, lo, hi };
   }
 
-  // time-domain weights w = C F u  (= IDCT(F^2 L c)/||F L c||) for a row's DCT c
+  // weight row w = a-hat^T D1 S with a-hat = D1 S i / ||D1 S i||; in the DCT basis w = (F u)^T C^T, u = F c / ||F c||
   function weights(ctx, flt, c) {
-    const { N, idct } = ctx, { f, F } = flt, v = new Float64Array(N); let n2 = 0;
-    for (let k = 0; k < N; k++) { const x = F[k] * f[k] * c[k]; n2 += x * x; v[k] = F[k] * x; }
+    const { N, idct } = ctx, { F } = flt, v = new Float64Array(N); let n2 = 0;
+    for (let k = 0; k < N; k++) { const x = F[k] * c[k]; n2 += x * x; v[k] = F[k] * x; }
     const n = Math.sqrt(n2); for (let k = 0; k < N; k++) v[k] /= n;
     return idct(v);
   }
 
+  // ---------- DM uncertainty (derivation step 6) ----------
+  // weight row w(t; d) built from the data dedispersed at trial DM d
+  function wRow(ctx, flt, Fch, d) { return weights(ctx, flt, ctx.dct(dedisperseRow(ctx, Fch, d))); }
+
+  // per-channel noise variance from each channel's k > N/4 DCT band: a constant (white) or sigma_nu(t)^2 (self-noise)
+  function chanVar(ctx, I) {
+    const { N, NCH, dct } = ctx, out = [];
+    for (let ch = 0; ch < NCH; ch++) { const c = dct(I.subarray(ch * N, ch * N + N)); out.push(ctx.selfnoise ? localVar(ctx, c) : sigmaHatN(c, N) ** 2); }
+    return out;
+  }
+  // model noise variance of the mock's channels (chi^2_4 / 4 has variance 1/2), after channel normalisation
+  function trueVar(ctx, ch) {
+    const { N, NCH, prof } = ctx, out = [];
+    for (let c = 0; c < NCH; c++) {
+      const s2 = ch.sd[c] * ch.sd[c];
+      if (!ctx.selfnoise) out.push(0.5 / s2);
+      else { const v = new Float64Array(N); for (let t = 0; t < N; t++) v[t] = 0.5 * (1 + prof[t]) ** 2 / s2; out.push(v); }
+    }
+    return out;
+  }
+
+  // spectrum of w'_nu(t) = [w(t - (dc+delta) tau_nu; dc+delta) - w(t - (dc-delta) tau_nu; dc-delta)] / 2 delta
+  // from the FFTs (P, M) of the two rows; a shift y(t) = w(t - s) is W(f) e^{-2 pi i f s}
+  function wpSpec(ctx, P, M, dc, delta, ch, xr, xi) {
+    const { N, tau, dt } = ctx, sp = (dc + delta) * tau[ch] / dt, sm = (dc - delta) * tau[ch] / dt, k2 = 1 / (2 * delta);
+    for (let k = 0; k < N; k++) {
+      const fk = (k <= N / 2 ? k : k - N) / N, ap = -2 * Math.PI * fk * sp, am = -2 * Math.PI * fk * sm;
+      const cp = Math.cos(ap), sp_ = Math.sin(ap), cm = Math.cos(am), sm_ = Math.sin(am);
+      xr[k] = (P.re[k] * cp - P.im[k] * sp_ - M.re[k] * cm + M.im[k] * sm_) * k2;
+      xi[k] = (P.re[k] * sp_ + P.im[k] * cp - M.re[k] * sm_ - M.im[k] * cm) * k2;
+    }
+  }
+  function spec(ctx, w) { const re = Float64Array.from(w), im = new Float64Array(ctx.N); ctx.fft(re, im, false); return { re, im }; }
+  // Var[e_par'(d0)] = sum_nu sum_t sigma_nu(t)^2 w'_nu(t)^2
+  function wprimeVar(ctx, wp, wm, dc, delta, sv) {
+    const { N, NCH, fft } = ctx, P = spec(ctx, wp), M = spec(ctx, wm), xr = new Float64Array(N), xi = new Float64Array(N);
+    let tot = 0;
+    for (let ch = 0; ch < NCH; ch++) {
+      wpSpec(ctx, P, M, dc, delta, ch, xr, xi); const v = sv[ch];
+      if (typeof v === "number") { let s = 0; for (let k = 0; k < N; k++) s += xr[k] * xr[k] + xi[k] * xi[k]; tot += v * s / N; }   // Parseval
+      else { fft(xr, xi, true); let s = 0; for (let t = 0; t < N; t++) s += v[t] * xr[t] * xr[t]; tot += s; }
+    }
+    return tot;
+  }
+  // w'_nu(t) in the time domain for one channel (for display)
+  function wprimeChan(ctx, wp, wm, dc, delta, ch) {
+    const { N, fft } = ctx, xr = new Float64Array(N), xi = new Float64Array(N);
+    wpSpec(ctx, spec(ctx, wp), spec(ctx, wm), dc, delta, ch, xr, xi); fft(xr, xi, true); return xr;
+  }
+
+  // sigma_DM from one realisation's data alone (step 6h): ||a||'' = 2 c2 from a parabola fit over |d - dhat| <= W,
+  // w'_nu by central difference with delta, sigma_nu from each channel's k > N/4 band. Start from a guess and
+  // refit with W = 3 sigma_DM, delta = sigma_DM / 2.
+  function sigmaDMdata(ctx, flt, FI, sv, S, dhat, guess) {
+    const { dms, ND } = ctx, step = dms[1] - dms[0];
+    let sdm = guess || 0.003, out = null;
+    for (let it = 0; it < 3; it++) {
+      const W = Math.min(Math.max(3 * sdm, 2.5 * step), 0.03), delta = Math.min(Math.max(sdm / 2, 1e-4), 0.01);
+      const xs = [], ys = []; for (let m = 0; m < ND; m++) if (Math.abs(dms[m] - dhat) <= W + 1e-9) { xs.push(dms[m]); ys.push(S[m]); }
+      const q = quadfit(xs, ys, dhat), Spp = 2 * q[2];
+      const wp = wRow(ctx, flt, FI, dhat + delta), wm = wRow(ctx, flt, FI, dhat - delta);
+      const slope = Math.sqrt(wprimeVar(ctx, wp, wm, dhat, delta, sv));
+      sdm = slope / Math.abs(Spp); out = { sigDM: sdm, Spp, slope, W, delta, q, x0: dhat, wp, wm };
+    }
+    return out;
+  }
+  // the same with the noiseless burst (only the mock knows it): exact curvature of ||a(d)|| at d0 = 0 and rows from s(t; d)
+  function sigmaDMtrue(ctx, flt, FS, svT) {
+    const { N } = ctx, { F } = flt, h = 0.001;
+    const an = d => { const c = ctx.dct(dedisperseRow(ctx, FS, d)); let s = 0; for (let k = 0; k < N; k++) s += (F[k] * c[k]) ** 2; return Math.sqrt(s); };
+    const Spp = (an(h) - 2 * an(0) + an(-h)) / (h * h), delta = 0.0005;
+    const slope = Math.sqrt(wprimeVar(ctx, wRow(ctx, flt, FS, delta), wRow(ctx, flt, FS, -delta), 0, delta, svT));
+    return { sigDM: slope / Math.abs(Spp), Spp, slope };
+  }
+
   // One Monte-Carlo realisation, reduced to the numbers the explorer needs.
   function mcOne(ctx, flt, seed, cubeFull, chans) {
-    const { N, NCH, i0, dct, sigTau, ND } = ctx, { f, F } = flt;
+    const { N, NCH, dct } = ctx, { f, F } = flt;
     const ch = chans || genChannels(ctx, seed, true);
-    const cube = cubeFull || dedisperse(ctx, chanFFT(ctx, ch.I));
+    const FI = chanFFT(ctx, ch.I);
+    const cube = cubeFull || dedisperse(ctx, FI);
     const A = analyse(ctx, cube, flt);
     // full-band d = 0 row: no shift, so it is the plain channel sum
     const i0r = new Float64Array(N), n0 = new Float64Array(N), s0 = new Float64Array(N);
     for (let c = 0; c < NCH; c++) for (let t = 0; t < N; t++) { i0r[t] += ch.I[c * N + t]; n0[t] += ch.X[c * N + t]; s0[t] += ch.Sg[c * N + t]; }
     const c0 = dct(i0r), nu = dct(n0), cs = dct(s0);
-    let S0 = 0, FL = 0, R = 0, F2L = 0;
-    for (let k = 0; k < N; k++) { const Fc = F[k] * c0[k]; S0 += Fc * Fc; FL += (Fc * f[k]) ** 2; R += (F[k] * (1 - f[k]) * c0[k]) ** 2; F2L += (F[k] * Fc * f[k]) ** 2; }
-    S0 = Math.sqrt(S0); FL = Math.sqrt(FL); R = Math.sqrt(R); F2L = Math.sqrt(F2L);
-    const sn = sigmaHatN(c0, N), sigW = sn * F2L / FL;
+    let S0 = 0, FL = 0, R = 0, F2 = 0;
+    for (let k = 0; k < N; k++) { const Fc = F[k] * c0[k]; S0 += Fc * Fc; FL += (Fc * f[k]) ** 2; R += (F[k] * (1 - f[k]) * c0[k]) ** 2; F2 += (F[k] * Fc) ** 2; }
+    S0 = Math.sqrt(S0); FL = Math.sqrt(FL); R = Math.sqrt(R); F2 = Math.sqrt(F2);
+    const sn = sigmaHatN(c0, N), sigW = sn * F2 / S0;
     const w = weights(ctx, flt, c0), lv = localVar(ctx, c0);
-    let sl = 0, wn = 0; for (let t = 0; t < N; t++) { sl += w[t] * w[t] * lv[t]; wn += w[t] * w[t]; }
-    const sigL = Math.sqrt(sl), sEff = ctx.selfnoise ? Math.sqrt(sl / wn) : sn;
+    let sl = 0; for (let t = 0; t < N; t++) sl += w[t] * w[t] * lv[t];
+    const sigL = Math.sqrt(sl);
     // true decomposition: eps = u_s^T F nu, ||e|| = ||F nu||
     let us = 0; for (let k = 0; k < N; k++) us += (F[k] * cs[k]) ** 2; us = Math.sqrt(us);
     let eps = 0, en = 0; for (let k = 0; k < N; k++) { eps += (F[k] * cs[k] / us) * F[k] * nu[k]; en += (F[k] * nu[k]) ** 2; }
@@ -311,10 +376,13 @@ function makeCore() {
     let rPar = 0, bPar = 0, bN = 0;
     for (let k = 0; k < N; k++) { const Rk = F[k] * (1 - f[k]), uk = F[k] * cs[k] / us; rPar += uk * Rk * c0[k]; bPar += uk * Rk * cs[k]; bN += (Rk * cs[k]) ** 2; }
     bN = Math.sqrt(bN);
-    const sigDM = sEff * sigTau * A.oFu / Math.abs(A.Spp);
-    return { oFu: A.oFu, S: Float32Array.from(A.S), dhat: A.dhat, lo: A.lo, hi: A.hi, S0, s23abs: R / FL * S0, s23rad: R, sigW, sigL, sigDM, eps, en, rPar, bPar, bN, A: us, sn, Spp: A.Spp };
+    // DM uncertainty: from this draw's data (step 6h) and with the noiseless burst
+    const dmD = sigmaDMdata(ctx, flt, FI, chanVar(ctx, ch.I), A.S, A.dhat);
+    const dmT = sigmaDMtrue(ctx, flt, chanFFT(ctx, ch.Sg), trueVar(ctx, ch));
+    return { S: Float32Array.from(A.S), dhat: A.dhat, lo: A.lo, hi: A.hi, S0, s23abs: R / FL * S0, s23rad: R, sigW, sigL, eps, en, rPar, bPar, bN, A: us, sn,
+      sigDM: dmD.sigDM, Spp: dmD.Spp, slope: dmD.slope, W: dmD.W, delta: dmD.delta, sigDMt: dmT.sigDM, SppT: dmT.Spp, slopeT: dmT.slope };
   }
 
-  return { setup, genChannels, chanFFT, dedisperse, dedisperseRow, dynspec, getKc, filters, analyse, weights, localVar, sigmaHatN, mcOne, seedFor, norm, median, std, quadfit, peakRefine, argmax, gaussian };
+  return { setup, genChannels, chanFFT, dedisperse, dedisperseRow, dynspec, getKc, filters, analyse, weights, localVar, sigmaHatN, mcOne, wRow, chanVar, trueVar, wprimeVar, wprimeChan, sigmaDMdata, sigmaDMtrue, seedFor, norm, median, std, quadfit, peakRefine, argmax, gaussian };
 }
 if (typeof module !== "undefined") module.exports = makeCore;

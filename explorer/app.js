@@ -284,7 +284,6 @@ function onCube(j, cube) {
     dispatchMC();
   }
   const A = K.analyse(ctx, cube, S.flt);
-  A.sigDM = A.sn[A.dpk] * ctx.sigTau * A.oFu / Math.abs(A.Spp);
   if (!S.heat) { let mx = -Infinity; for (let m = 0; m < ctx.ND; m++) for (let t = TW0; t < TW1; t++) mx = Math.max(mx, cube[m * N + t]); S.heat = { vmin: -2 * A.sn[ctx.i0], vmax: 0.9 * mx }; }
   S.stack[j] = { j, cube, A };
   drawCard(j); draw("cv-sd"); setStatus();
@@ -312,22 +311,24 @@ function selectRealisation(j) {
     sigL = new Float64Array(ctx.ND);
     for (let m = 0; m < ctx.ND; m++) { const c = A.C.subarray(m * N, (m + 1) * N), w = K.weights(ctx, flt, c), lv = K.localVar(ctx, c); let s = 0; for (let t = 0; t < N; t++) s += w[t] * w[t] * lv[t]; sigL[m] = Math.sqrt(s); }
   }
-  // weights at the peak row for stage 5
-  const cpk = A.C.subarray(A.dpk * N, (A.dpk + 1) * N), wPk = K.weights(ctx, flt, cpk), wdPk = cdiff(wPk);
-  S.sd = { j, ch, FI, FS, A, cube: st.cube, s0, cs0, sigL, wPk, wdPk, ww: support(wPk, 0.15, 30), truth0: truthAt(cs0, A.sn[ctx.i0]), anorm, aq };
-  setV("sigTau", fx(ctx.sigTau, 1)); setV("wdot", sig(nrm(wdPk) / ctx.dt, 4)); setV("oFu", sig(A.oFu, 4));
+  // stage 5: the data recipe at this draw's measured peak d-hat (derivation step 6h)
+  const dm = K.sigmaDMdata(ctx, flt, FI, K.chanVar(ctx, ch.I), A.S, A.dhat); A.sigDM = dm.sigDM;
+  const wHat = K.wRow(ctx, flt, FI, A.dhat), wdHat = cdiff(wHat).map(v => v / ctx.dt);
+  const wpTop = K.wprimeChan(ctx, dm.wp, dm.wm, A.dhat, dm.delta, 0), wpBot = K.wprimeChan(ctx, dm.wp, dm.wm, A.dhat, dm.delta, NCH - 1);
+  S.sd = { j, ch, FI, FS, A, cube: st.cube, s0, cs0, sigL, dm, wHat, wdHat, wpTop, wpBot, wCache: new Map(), ww: support(wHat, 0.15, 30), truth0: truthAt(cs0, A.sn[ctx.i0]), anorm, aq };
+  setV("dmW", dm.W.toFixed(4)); setV("dmDelta", dm.delta.toFixed(4)); setV("sigDMsel", sig(dm.sigDM, 3));
   $("#s2-title").textContent = `Realisation #${j + 1}: I(t, ΔDM)`;
   if (S.row == null) S.row = A.dpk;
   setRow(S.row);
   draw("cv-sd"); draw("cv-cube"); draw("cv-sprof"); drawStep5(); schedule("mc");
 }
 function truthAt(cs, sn) {
-  const { F, f, R } = S.flt, N = cs.length, om = S.ctx.omega;
+  const { F, R } = S.flt, N = cs.length;
   let a = 0; for (let k = 0; k < N; k++) a += (F[k] * cs[k]) ** 2; a = Math.sqrt(a);
-  let Fu2 = 0, oFu = 0, T = 0, Rb = 0;
-  for (let k = 0; k < N; k++) { const u = F[k] * cs[k] / a; Fu2 += (F[k] * u) ** 2; oFu += (om[k] * F[k] * u) ** 2; T += R[k] * R[k]; Rb += (R[k] * cs[k]) ** 2; }
+  let Fu2 = 0, T = 0, Rb = 0;
+  for (let k = 0; k < N; k++) { const u = F[k] * cs[k] / a; Fu2 += (F[k] * u) ** 2; T += R[k] * R[k]; Rb += (R[k] * cs[k]) ** 2; }
   const Neff = T / Fu2, Gam = Rb / (sn * sn * T);
-  return { a, Fu: Math.sqrt(Fu2), oFu: Math.sqrt(oFu), T, Neff, Gam };
+  return { a, Fu: Math.sqrt(Fu2), T, Neff, Gam };
 }
 function setRow(m) {
   const sd = S.sd; if (!sd) return;
@@ -336,7 +337,7 @@ function setRow(m) {
   const c = A.C.subarray(m * N, (m + 1) * N), i = Float64Array.from(sd.cube.subarray(m * N, (m + 1) * N));
   const s = K.dedisperseRow(ctx, sd.FS, d), cs = ctx.dct(s), n = i.map((v, t) => v - s[t]), nu = ctx.dct(n);
   const ti = ctx.idct(c.map((v, k) => v * flt.f[k])), D1ti = diff(ti);
-  const Sti = ctx.idct(c.map((v, k) => v * flt.f[k] * flt.f[k])), aS = diff(Sti), aN = nrm(aS), ah = aS.map(v => v / aN);
+  const aN = nrm(D1ti), ah = D1ti.map(v => v / aN);   // a-hat estimated as D1 S i / ||D1 S i||
   const d1t = D1T(ah), w = K.weights(ctx, flt, c);
   const eps = dot(w, n), sn = A.sn[m];
   let en = 0; for (let k = 0; k < N; k++) en += (flt.F[k] * nu[k]) ** 2; en = Math.sqrt(en);
@@ -444,7 +445,7 @@ function mcStats() {
     n, mcS: K.std(g("S0")), mcEps: K.std(g("eps")), sig: K.median(g(sn ? "sigL" : "sigW")), s23: K.median(g("s23abs")), s23rad: K.median(g("s23rad")), en: K.median(g("en")),
     mcDM: K.std(g("dhat")), mDM: mean(g("dhat")), sigDM: K.median(g("sigDM")), hw: ok.length ? K.median(ok.map(r => 0.5 * (r.hi - r.lo))) : null,
     lo: ok.length ? K.median(ok.map(r => r.lo)) : null, hi: ok.length ? K.median(ok.map(r => r.hi)) : null,
-    ref, slopes, slopeMC: K.std(slopes), slopeData: K.median(R.map(r => r.sigDM * Math.abs(r.Spp))), snMed: K.median(g("sn")), q, Sbpp: 2 * q[2]
+    ref, slopes, slopeMC: K.std(slopes), slopeData: K.median(g("slope")), slopeTrue: K.median(g("slopeT")), sigDMt: K.median(g("sigDMt")), SppT: K.median(g("SppT")), q, Sbpp: 2 * q[2]
   };
 }
 function chip(ratio) { if (!isFinite(ratio)) return ""; const good = ratio > 0.67 && ratio < 1.5; return `<span class="chip ${good ? "good" : "bad"}">×${ratio < 10 ? ratio.toFixed(2) : ratio.toFixed(1)}</span>`; }
@@ -460,13 +461,12 @@ function updateSummary() {
   const edge = st.lo != null && (st.lo <= S.ctx.dms[0] + 1e-9 || st.hi >= S.ctx.dms[S.ctx.ND - 1] - 1e-9), ge = edge ? "≥ " : "";
   $("#b-d-s23").innerHTML = (st.hw != null ? ge + sig(st.hw, 3) + ` <span class='muted' style='font-family:var(--font-body);font-size:12px'>half-width${edge ? ", hits grid edge" : ""}</span>` + chip(st.hw / st.mcDM).replace("×", ge ? "≥×" : "×") : "–");
   setV("mcEps", fx(st.mcEps, 3)); setV("mcS", fx(st.mcS, 3)); setV("mcSig", fx(st.sig, 3));
-  setV("mcDM", sig(st.mcDM, 3)); setV("sigDM", sig(st.sigDM, 3)); setV("s23hw", st.hw != null ? sig(st.hw, 3) : "–");
+  setV("mcDM", sig(st.mcDM, 3)); setV("sigDM", sig(st.sigDM, 3)); setV("sigDMt", sig(st.sigDMt, 3)); setV("slopeTrue", fx(st.slopeTrue, 2)); setV("s23hw", st.hw != null ? sig(st.hw, 3) : "–");
   setV("slopeMC", fx(st.slopeMC, 2)); setV("slopeData", fx(st.slopeData, 2));
   setV("Sbarpp", fx(st.Sbpp, 0));
   const sd = S.sd;
   if (sd) {
     const t0 = sd.truth0, A = sd.A, i0 = S.ctx.i0, normf = A.S[i0] / A.FLn[i0];
-    setV("slopeTrue", fx(st.snMed * S.ctx.sigTau * t0.oFu, 2));
     setV("Neff0", fx(t0.Neff, 2)); setV("sNeff0", fx(Math.sqrt(t0.Neff), 2)); setV("sGam0", fx(Math.sqrt(1 + t0.Gam), 2)); setV("normf", fx(normf, 2));
     const pred = Math.sqrt(t0.Neff * (1 + t0.Gam)) * normf, meas = st.s23 / st.mcS;
     setV("predRatio", fx(pred, 1)); setV("measRatio", fx(meas, 1));
@@ -568,14 +568,14 @@ FIG["cv-dyn"] = cv => {
   blit(ax, heatImg((r, q) => data[r * TW + q], NCH, TW, -2 * sdv, vmax), false);
   ax.frame({ ylabel: "ν (MHz)", grid: false, noXlab: false });
   // delay track of the first burst component
-  const xs = [], ys = []; for (let c = 0; c < NCH; c++) { xs.push(1000 + rd.d * ctx.tau[c]); ys.push(ctx.freqs[c]); }
+  const xs = [], ys = []; for (let c = 0; c < NCH; c++) { xs.push(1000 - rd.d * ctx.tau[c]); ys.push(ctx.freqs[c]); }
   ax.clip(); ax.line(xs, ys, { c: P.deriv, lw: 1.6, dash: [5, 4] }); ax.unclip();
   cv._ax = ax; cv._raw = raw;
 };
 bindHover($("#cv-dyn"), (ev, x, y) => {
   const cv = $("#cv-dyn"), ax = cv._ax; if (!ax || x == null || x < ax.px0 || x > ax.px1 || y < ax.py1 || y > ax.py0) return tip(ev, null);
   const ctx = S.ctx, c = Math.min(ctx.NCH - 1, Math.max(0, Math.floor((ax.py0 - y) / (ax.py0 - ax.py1) * ctx.NCH))), ch = ctx.NCH - 1 - c, t = Math.floor(ax.iX(x));
-  tip(ev, `channel ${ch} · ν = ${fx(ctx.freqs[ch], 0)} MHz<br>τ<sub>ν</sub> = ${fx(ctx.tau[ch], 0)} μs per pc cm⁻³<br>shift here ΔDM·τ<sub>ν</sub> = ${fx(S.rd.d * ctx.tau[ch], 1)} μs<br>t = ${t} μs · I = ${fx(cv._raw[ch * TW + (t - TW0)], 2)}`);
+  tip(ev, `channel ${ch} · ν = ${fx(ctx.freqs[ch], 0)} MHz<br>τ<sub>ν</sub> = ${fx(ctx.tau[ch], 0)} μs per pc cm⁻³<br>advanced here by ΔDM·τ<sub>ν</sub> = ${fx(S.rd.d * ctx.tau[ch], 1)} μs<br>t = ${t} μs · I = ${fx(cv._raw[ch * TW + (t - TW0)], 2)}`);
 });
 FIG["cv-row"] = cv => {
   const rd = S.rd; if (!rd) return;
@@ -631,7 +631,7 @@ function tplot(cv, series, o) {
 FIG.f42a = cv => { const rd = S.rd; if (!rd) return; tplot(cv, [{ y: rd.i, c: P.mc, lw: 1 }, { y: rd.ti, c: P.ink, lw: 2 }, { y: rd.s, c: P.sig, lw: 1.6, dash: [5, 4] }], { ylabel: "I", noX: true }); };
 FIG.f42b = cv => { const rd = S.rd; if (!rd) return; tplot(cv, [{ y: rd.D1ti, c: P.ink, lw: 1.8, fill: 0.12 }], { ylabel: "D₁ĩ", zero: true, sym: true }); };
 FIG.f43a = cv => { const rd = S.rd; if (!rd) return; tplot(cv, [{ y: rd.ah, c: P.ink, lw: 1.8 }], { t0: rd.ww[0], t1: rd.ww[1], xlabel: "t (μs)", nx: 3, zero: true, sym: true, m: { l: 50, r: 10, t: 8, b: 32 }, ny: 3, ylabel: "â" }); };
-FIG.f43b = cv => { const rd = S.rd; if (!rd) return; tplot(cv, [{ y: rd.d1t, c: P.deriv, lw: 1.8 }], { t0: rd.ww[0], t1: rd.ww[1], xlabel: "t (μs)", nx: 3, zero: true, sym: true, m: { l: 50, r: 10, t: 8, b: 32 }, ny: 3, ylabel: "D₁ᵀâ" }); };
+FIG.f43b = cv => { const rd = S.rd; if (!rd) return; tplot(cv, [{ y: rd.d1t, c: P.deriv, lw: 1.8 }], { t0: rd.ww[0], t1: rd.ww[1], xlabel: "t (μs)", nx: 3, zero: true, sym: true, m: { l: 50, r: 10, t: 8, b: 32 }, ny: 3, ylabel: "âᵀD₁" }); };
 FIG.f43c = cv => { const rd = S.rd; if (!rd) return; tplot(cv, [{ y: rd.w, c: P.w, lw: 1.8 }], { t0: rd.ww[0], t1: rd.ww[1], xlabel: "t (μs)", nx: 3, zero: true, sym: true, m: { l: 50, r: 10, t: 8, b: 32 }, ny: 3, ylabel: "w" }); };
 FIG.f43d = cv => {
   const rd = S.rd; if (!rd) return;
@@ -762,24 +762,28 @@ function drawStep5() { const k = S.step5; ({ 0: ["f50"], 1: ["f51a", "f51b"], 2:
 function updateStep5Vals() {
   const ctx = S.ctx; if (!ctx) return; const ch = +$("#r-ch").value, dd = +$("#r-dd").value;
   setV("chFreq", fx(ctx.freqs[ch], 0) + " MHz"); setV("ddVal", (dd >= 0 ? "+" : MINUS) + Math.abs(dd).toFixed(4));
-  setV("tauCh", fx(ctx.tau[ch] - ctx.tauMean, 0)); setV("shiftCh", fx((ctx.tau[ch] - ctx.tauMean) * dd, 2));
+  setV("tauCh", fx(ctx.tau[ch] - ctx.tauMean, 0)); setV("shiftCh", fx((ctx.tau[ch] - ctx.tauMean) * dd, 2)); setV("tauBar", fx(ctx.tauMean, 1));
   const st = S.st, tv = +$("#r-tilt").value; setV("tiltVal", (tv >= 0 ? "+" : MINUS) + Math.abs(tv).toFixed(1) + " σ");
   if (st) setV("tiltShift", fdm(-tv * st.slopeMC / st.Sbpp) + " pc cm⁻³");
 }
+// weight row at an arbitrary trial DM for the selected draw (cached)
+function wAt(d) { const sd = S.sd, k = d.toFixed(6); if (!sd.wCache.has(k)) sd.wCache.set(k, K.wRow(S.ctx, S.flt, sd.FI, d)); return sd.wCache.get(k); }
 FIG.f50 = cv => {
-  const sd = S.sd; if (!sd) return; const ctx = S.ctx, N = ctx.N, ch = +$("#r-ch").value, dd = +$("#r-dd").value;
-  const x = sd.ch.X.subarray(ch * N, (ch + 1) * N), w = sd.wPk, sh = (ctx.tau[ch] - ctx.tauMean) * dd / ctx.dt;
-  const [a, b] = sd.ww; let xm = 0, wm = 0; for (let t = a; t < b; t++) { xm = Math.max(xm, Math.abs(x[t])); wm = Math.max(wm, Math.abs(w[t])); }
-  const sc = xm * 0.85 / wm, ws = new Float64Array(N), w0 = new Float64Array(N);
-  for (let t = 0; t < N; t++) { w0[t] = w[t] * sc; ws[t] = interp(w, t + sh) * sc; }
-  const ax = tplot(cv, [{ y: x, c: P.mc, lw: 1 }, { y: w0, c: P.w, lw: 2.2, noscale: true }, { y: ws, c: P.w, lw: 2.2, dash: [6, 4], noscale: true }], { t0: a, t1: b, ylabel: "x_{ν} (normalised)", zero: true, sym: true });
-  if (ax) ax.text(`weights slide ${fx(Math.abs(sh), 1)} μs ${sh > 0 ? "←" : "→"}`, b - 4, ax.ya + (ax.yb - ax.ya) * 0.94, { al: "right", c: P.w });
+  const sd = S.sd; if (!sd) return; const ctx = S.ctx, N = ctx.N, ch = +$("#r-ch").value, dd = +$("#r-dd").value, dh = sd.A.dhat;
+  const x = sd.ch.X.subarray(ch * N, (ch + 1) * N), w0 = sd.wHat, w1 = wAt(dh + dd);
+  const s0 = dh * ctx.tau[ch] / ctx.dt, s1 = (dh + dd) * ctx.tau[ch] / ctx.dt, net = dd * (ctx.tau[ch] - ctx.tauMean) / ctx.dt;
+  const [a, b] = sd.ww; let xm = 0, wm = 0; for (let t = a; t < b; t++) { xm = Math.max(xm, Math.abs(x[t])); wm = Math.max(wm, Math.abs(w0[t])); }
+  const sc = xm * 0.85 / wm, y0 = new Float64Array(N), y1 = new Float64Array(N);
+  for (let t = 0; t < N; t++) { y0[t] = interp(w0, t - s0) * sc; y1[t] = interp(w1, t - s1) * sc; }
+  const ax = tplot(cv, [{ y: x, c: P.mc, lw: 1 }, { y: y0, c: P.w, lw: 2.2, noscale: true }, { y: y1, c: P.w, lw: 2.2, dash: [6, 4], noscale: true }], { t0: a, t1: b, ylabel: "x_{ν} (normalised)", zero: true, sym: true });
+  if (ax) ax.text(`net slide ${fx(Math.abs(net), 1)} μs ${net > 0 ? "→" : "←"}`, b - 4, ax.ya + (ax.yb - ax.ya) * 0.94, { al: "right", c: P.w });
 };
 FIG.f51a = cv => {
-  const sd = S.sd; if (!sd) return; const ctx = S.ctx, N = ctx.N, dd = +$("#r-dd").value, w = sd.wPk, wd = sd.wdPk;
-  const mk = ch => { const sh = (ctx.tau[ch] - ctx.tauMean) * dd / ctx.dt, a = new Float64Array(N), b = new Float64Array(N); for (let t = 0; t < N; t++) { a[t] = interp(w, t + sh) - w[t]; b[t] = sh * wd[t]; } return [a, b]; };
-  const [a0, b0] = mk(0), [a1, b1] = mk(ctx.NCH - 1);
-  tplot(cv, [{ y: a0, c: P.w, lw: 2 }, { y: a1, c: P.deriv, lw: 2 }, { y: b0, c: P.ink, lw: 1.2, dash: [1.5, 3] }, { y: b1, c: P.ink, lw: 1.2, dash: [1.5, 3] }], { t0: sd.ww[0], t1: sd.ww[1], ylabel: "Δw", zero: true, sym: true });
+  const sd = S.sd; if (!sd) return; const ctx = S.ctx, N = ctx.N, dh = sd.A.dhat;
+  // same-profile form (visualisation only): -(tau_nu - tau-bar) w-dot(t - d tau_nu)
+  const sp = c => { const s = dh * ctx.tau[c] / ctx.dt, k = -(ctx.tau[c] - ctx.tauMean), o = new Float64Array(N); for (let t = 0; t < N; t++) o[t] = k * interp(sd.wdHat, t - s); return o; };
+  tplot(cv, [{ y: sd.wpTop, c: P.w, lw: 2 }, { y: sd.wpBot, c: P.deriv, lw: 2 }, { y: sp(0), c: P.ink, lw: 1.2, dash: [1.5, 3] }, { y: sp(ctx.NCH - 1), c: P.ink, lw: 1.2, dash: [1.5, 3] }],
+    { t0: sd.ww[0], t1: sd.ww[1], ylabel: "w′_{ν} (per pc cm⁻³)", zero: true, sym: true });
 };
 FIG.f51b = cv => {
   const ctx = S.ctx; if (!ctx) return; const ax = new Ax(cv, { b: 36 }); if (!ax.ok) return;
